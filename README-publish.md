@@ -16,14 +16,13 @@ This guide is for end users who want to use the published Docker image (e.g., fr
 version: '3.8'
 services:
   immich-smart-album:
-    image: <your-dockerhub-username>/immich-smart-album:latest
+    image: ssultanali/immich-smart-album:latest
     container_name: immich-smart-album
     volumes:
       - ./data:/data
-    restart: "no"
+    restart: "always"
 ```
 
-- Replace `<your-dockerhub-username>` with the actual Docker Hub username or image name.
 - Make sure your `data/config.json` is in the same directory as your compose file.
 
 ### Example `data/config.json`
@@ -68,7 +67,7 @@ docker compose pull
 ## Troubleshooting
 - Ensure your Immich server and API key are correct.
 - Check logs for errors or warnings.
-- Set `logLevel` to `debug` for more details.
+- Set `logLevel` to `debug` or `info` for more details.
 
 ## License
 MIT
