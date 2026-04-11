@@ -1,0 +1,20 @@
+{
+  "immichServer": "https://photos.homehub.party",
+  "users": [
+    {
+      "apiKey": "hSKZROTPGp5F4J2QcKTdN99kjiQ4aQR0Kp7yHN8du4",
+      "albums": [
+        {
+          "name": "t1",
+          "albumId": "f3ed9028-a682-466c-a008-e91746c21818",
+          "faceNames": ["Ayaana"],
+          "excludeFaceNames": ["Ayzel"],
+          "logic": "AND"
+        }
+      ]
+    }
+  ],
+  "options": {
+    "logLevel": "info"
+  }
+}

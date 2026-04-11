@@ -25,7 +25,23 @@ services:
 
 - Make sure your `config/config.json` is in the same directory as your compose file.
 
-### Example `config/config.json`
+### Configuration Key Explanations
+
+- `immichServer`: The base URL of your Immich server (e.g., `https://your-immich-server`).
+- `users`: An array of user objects, each with:
+  - `apiKey`: The Immich API key for this user.
+  - `albums`: An array of album objects, each with:
+    - `name`: (string) For your reference only; not used as the Immich album title.
+    - `albumId`: (string) The Immich album UUID to manage.
+    - `faceNames`: (array of strings) Only faceNames are supported; these people must be present in the photo.
+    - `excludeFaceNames`: (array of strings, optional) If any of these people are present in a photo, it will be excluded from the album.
+    - `logic`: ("AND" or "OR")
+      - "AND": Only photos containing all listed `faceNames` are included.
+      - "OR": Photos containing any of the listed `faceNames` are included.
+- `options`: (object)
+  - `logLevel`: ("info" or "debug") Controls the verbosity of log output.
+
+### Example config/config.json
 ```json
 {
   "immichServer": "https://your-immich-server",
@@ -36,7 +52,8 @@ services:
         {
           "name": "Family Album",
           "albumId": "your-album-id",
-          "faceIds": ["face-id-1", "face-id-2"],
+          "faceNames": ["Alice", "Bob"],
+          "excludeFaceNames": ["Eve", "Mallory"],
           "logic": "OR"
         }
       ]
