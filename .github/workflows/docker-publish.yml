@@ -1,3 +1,4 @@
+name: Build and Publish Docker image
       - name: Update Docker Hub description
         uses: peter-evans/dockerhub-description@v3
         with:
@@ -5,7 +6,6 @@
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: ${{ secrets.DOCKERHUB_USERNAME }}/immich-smart-album
           readme-filepath: README-publish.md
-name: Build and Publish Docker image
 
 on:
   release:
