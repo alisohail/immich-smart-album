@@ -9,7 +9,7 @@ This guide is for end users who want to use the published Docker image (e.g., fr
 - Immich API key(s) for the user(s) you want to manage albums for
 
 ## Setup
-1. Prepare your `data/config.json` as described below.
+1. Prepare your `config/config.json` as described below.
 2. Place the following `docker-compose.yml` in your working directory:
 
 ```yaml
@@ -19,13 +19,13 @@ services:
     image: ssultanali/immich-smart-album:latest
     container_name: immich-smart-album
     volumes:
-      - ./data:/data
+      - ./config:/config
     restart: "always"
 ```
 
-- Make sure your `data/config.json` is in the same directory as your compose file.
+- Make sure your `config/config.json` is in the same directory as your compose file.
 
-### Example `data/config.json`
+### Example `config/config.json`
 ```json
 {
   "immichServer": "https://your-immich-server",
@@ -49,7 +49,7 @@ services:
 ```
 
 ## Running
-From the directory containing your `docker-compose.yml` and `data/config.json`:
+From the directory containing your `docker-compose.yml` and `config/config.json`:
 
 ```
 docker compose up -d

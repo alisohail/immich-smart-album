@@ -19,7 +19,7 @@ This project creates smart albums in Immich based on face IDs, with support for 
    ```
    npm run build
    ```
-4. Edit `data/config.json` as needed (see the publish guide for config format).
+4. Edit `config/config.json` as needed (see the publish guide for config format).
 
 ## Running Locally (without Docker)
 From the `app` directory:
@@ -33,7 +33,7 @@ From the project root:
 
 ```
 docker build -t immich-smart-album .
-docker run --rm -v $(pwd)/data:/data immich-smart-album
+docker run --rm -v $(pwd)/config:/config immich-smart-album
 ```
 
 Or use Docker Compose (recommended for end users, see the publish guide):

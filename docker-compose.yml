@@ -5,6 +5,7 @@ services:
     container_name: immich-smart-album
     restart: always
     volumes:
-      - ./data:/data
+      - ./config:${CONFIG_DIR:-/config}
     environment:
-      - SMART_ALBUM_CONFIG=/data/config.json
+      - CONFIG_DIR=${CONFIG_DIR:-/config}
+      - SMART_ALBUM_CONFIG=${CONFIG_DIR:-/config}/config.json

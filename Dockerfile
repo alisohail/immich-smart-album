@@ -9,4 +9,5 @@ WORKDIR /app
 COPY --from=builder /app ./
 RUN npm ci --omit=dev
 ENV NODE_ENV=production
+ENV CONFIG_DIR=/config
 CMD ["node", "dist/main.js"]
