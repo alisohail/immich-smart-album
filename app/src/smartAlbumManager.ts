@@ -5,11 +5,12 @@ import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbu
 export class SmartAlbumManager {
   private config: SmartAlbumConfig
   private logger: ReturnType<typeof createLogger>
+  private logLevel: 'debug' | 'info'
 
   constructor(config: SmartAlbumConfig) {
     this.config = config
-    const logLevel = config.options?.logLevel || 'info'
-    this.logger = createLogger(logLevel)
+    this.logLevel = config.options?.logLevel || 'info'
+    this.logger = createLogger(this.logLevel)
   }
 
   async run() {
@@ -72,7 +73,7 @@ export class SmartAlbumManager {
       return id
     }
 
-    if (this.logger.level === 'info') {
+    if (this.logLevel === 'info') {
       this.logger.info(`Processing album: ${album.name}`)
       this.logger.info(`Logic: ${album.logic}`)
       this.logger.info(`faceNames: ${album.faceNames?.join(', ') || ''}`)
