@@ -1,0 +1,21 @@
+{
+  "immichServer": "https://your-immich-server",
+  "schedule": "0,30 * * * *",
+  "users": [
+    {
+      "apiKey": "YOUR_API_KEY",
+      "albums": [
+        {
+          "name": "Family Album",
+          "albumId": "your-album-id",
+          "faceNames": ["Alice", "Bob"],
+          "excludeFaceNames": ["Eve", "Mallory"],
+          "logic": "OR"
+        }
+      ]
+    }
+  ],
+  "options": {
+    "logLevel": "info"
+  }
+}

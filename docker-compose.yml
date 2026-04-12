@@ -1,0 +1,11 @@
+version: '3.8'
+services:
+  immich-smart-album:
+    build: .
+    container_name: immich-smart-album
+    restart: always
+    volumes:
+      - ./config:${CONFIG_DIR:-/config}
+    environment:
+      - CONFIG_DIR=${CONFIG_DIR:-/config}
+      - SMART_ALBUM_CONFIG=${CONFIG_DIR:-/config}/config.json

@@ -1,0 +1,23 @@
+{
+  "name": "immich-smart-album",
+  "version": "0.1.0",
+  "description": "Create smart albums in Immich based on face IDs with flexible logic.",
+  "main": "dist/main.js",
+  "scripts": {
+    "dev": "ts-node src/main.ts",
+    "build": "tsc",
+    "start": "node dist/main.js"
+  },
+  "author": "Sohail Ali",
+  "license": "MIT",
+  "dependencies": {
+    "@immich/sdk": "^2.7.4",
+    "node-cron": "^4.2.1",
+    "dayjs": "^1.11.10"
+  },
+  "devDependencies": {
+    "typescript": "^5.6.2",
+    "ts-node": "^10.9.2",
+    "@types/node": "^16.18.111"
+  }
+}
