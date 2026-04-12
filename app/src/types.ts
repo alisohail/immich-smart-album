@@ -12,12 +12,13 @@ export interface SmartAlbumOptions {
 
 export interface ImmichClient {
   apiKey: string
-  albums: AlbumLogic[]
+  albums: AlbumSettings[]
 }
 
-export interface AlbumLogic {
+export interface AlbumSettings {
   name: string
   albumId: string
-  faceIds: string[]
+  faceNames: string[]
+  excludeFaceNames?: string[]
   logic: 'AND' | 'OR'
 }

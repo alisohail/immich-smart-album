@@ -1,7 +1,7 @@
 # Immich Smart Album (Developer Guide)
 
 ## Overview
-This project creates smart albums in Immich based on face IDs, with support for AND/OR logic, robust logging, and error handling. It is written in TypeScript and runs as a Docker container.
+This project creates smart albums in Immich based on face names (person names), with support for AND/OR logic, robust logging, and error handling. You can also exclude people from albums using excludeFaceNames. It is written in TypeScript and runs as a Docker container.
 
 ## Prerequisites
 - Node.js and npm
