@@ -36,6 +36,10 @@ docker build -t immich-smart-album .
 docker run --rm -v $(pwd)/config:/config immich-smart-album
 ```
 
+## Published Latest Docker image
+Find latest published docker container at https://hub.docker.com/r/ssultanali/immich-smart-album
+
+
 **How scheduling works:**
 
 When the Docker container starts, the app processes albums immediately on startup, then waits for the next scheduled run (as set in your config or the default schedule). You do not need to wait for the first scheduled time—the sync happens right away, then repeats on schedule.

@@ -1,4 +1,8 @@
 app/node_modules
 app/dist
+.git
+.github
 *.log
 .env
+config
+README*.md
