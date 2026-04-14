@@ -3,6 +3,9 @@
 ## Overview
 This guide is for end users who want to use the published Docker image (e.g., from Docker Hub) to run Immich Smart Album without building from source.
 
+## GitHub Repository
+Find the source code and contribute at: [Immich Smart Album GitHub Repository](https://github.com/alisohail/immich-smart-album)
+
 ## Prerequisites
 - Docker and Docker Compose installed
 - Immich server running and accessible
@@ -28,7 +31,7 @@ services:
 ### Configuration Key Explanations
 
 - `immichServer`: The base URL of your Immich server (e.g., `http://your-immich-server:port`).
-- `schedule`: set custom value to auto sync you albums with new changes. default is 30 mins.
+- `schedule`: (optional, string) A cron expression for how often to sync albums (e.g., `"0,30 * * * *"` for every 30 minutes). If omitted, the default is every 30 minutes. On container start, the app will always run once immediately, then follow the schedule.
 - `users`: An array of user objects, each with:
   - `apiKey`: The Immich API key for this user.
   - `albums`: An array of album objects, each with:
@@ -87,6 +90,7 @@ docker compose pull
 - Ensure your Immich server and API key are correct.
 - Check logs for errors or warnings.
 - Set `logLevel` to `debug` or `info` for more details.
+
 
 ## License
 MIT

@@ -1,24 +1,34 @@
 import { ImmichClient, AlbumSettings, SmartAlbumConfig } from './types'
 import { createLogger } from './utils'
-import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum } from '@immich/sdk'
+import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getAlbumInfo } from '@immich/sdk'
+
+const PAGE_SIZE = 100
 
 export class SmartAlbumManager {
   private config: SmartAlbumConfig
   private logger: ReturnType<typeof createLogger>
   private logLevel: 'debug' | 'info'
 
+  /**
+   * @param config - The full smart album configuration, including server URL,
+   *                 user API keys, album definitions, and optional log level.
+   */
   constructor(config: SmartAlbumConfig) {
     this.config = config
     this.logLevel = config.options?.logLevel || 'info'
     this.logger = createLogger(this.logLevel)
   }
 
+  /**
+   * Iterates over all configured users, initialises the Immich SDK for each,
+   * and processes every album defined under that user.
+   */
   async run() {
     for (const user of this.config.users) {
       try {
         init({ baseUrl: this.config.immichServer + '/api', apiKey: user.apiKey })
         for (const album of user.albums) {
-          await this.processAlbum(album, user.apiKey)
+          await this.processAlbum(album)
         }
       } catch (err) {
         this.logger.error('User processing failed', err)
@@ -26,184 +36,315 @@ export class SmartAlbumManager {
     }
   }
 
-  async processAlbum(album: AlbumSettings, apiKey: string) {
-    // Helper to resolve names to IDs
-    const resolveNames = async (names: string[] = [], label = 'face') => {
-      const ids: string[] = []
-      for (const name of names) {
-        try {
-          const result = await searchPerson({ name })
-          if (result && Array.isArray(result) && result.length > 0) {
-            ids.push(result[0].id)
-            this.logger.info(`Resolved ${label} name '${name}' to id '${result[0].id}'`)
-          } else {
-            this.logger.info(`No match found for ${label} name '${name}'`)
-          }
-        } catch (err) {
-          this.logger.error(`Error resolving ${label} name '${name}':`, err)
-        }
-      }
-      return ids
-    }
+  /**
+   * Processes a single album end-to-end:
+   * resolves face names → IDs, fetches matching assets, adds them to the album,
+   * and removes any assets belonging to excluded faces.
+   *
+   * @param album - The album settings to process.
+   */
+  async processAlbum(album: AlbumSettings) {
+    const { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId } = await this.resolveAllFaceIds(album)
+    const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
-    // Map faceNames to IDs and keep a reverse map for logging
-    const faceNameToId: Record<string, string> = {}
-    const excludeFaceNameToId: Record<string, string> = {}
-    const faceIds: string[] = []
-    for (const name of album.faceNames || []) {
-      const ids = await resolveNames([name], 'face')
-      if (ids[0]) {
-        faceIds.push(ids[0])
-        faceNameToId[name] = ids[0]
-      }
-    }
-    const excludeFaceIds: string[] = []
-    for (const name of album.excludeFaceNames || []) {
-      const ids = await resolveNames([name], 'exclude face')
-      if (ids[0]) {
-        excludeFaceIds.push(ids[0])
-        excludeFaceNameToId[name] = ids[0]
-      }
-    }
+    this.logAlbumHeader(album)
 
-    // Helper to get face name from id for logging
-    const getFaceName = (id: string) => {
-      for (const [name, fid] of Object.entries(faceNameToId)) if (fid === id) return name
-      for (const [name, fid] of Object.entries(excludeFaceNameToId)) if (fid === id) return name
-      return id
-    }
-
-    if (this.logLevel === 'info') {
-      this.logger.info(`Processing album: ${album.name}`)
-      this.logger.info(`Logic: ${album.logic}`)
-      this.logger.info(`faceNames: ${album.faceNames?.join(', ') || ''}`)
-      this.logger.info(`excludeFaceNames: ${album.excludeFaceNames?.join(', ') || ''}`)
-    } else {
-      this.logger.info(`Processing album: ${album.name}`)
-      this.logger.debug('Album details:', album)
-    }
     try {
-      const PAGE_SIZE = 100
-      // For OR: collect all asset IDs in a Set (union)
-      // For AND: collect asset IDs per face, then intersect
-      let assetIdSets: Array<Set<string>> = []
+      const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
+      const finalAssetIds = await this.collectTargetAssetIds(album, faceIds, excludedAssetIds, getFaceName)
 
-      // Helper to check if asset should be excluded
-      const isExcluded = (asset: any) => {
-        if (!excludeFaceIds.length) return false
-        const people = Array.isArray(asset.people)
-          ? asset.people.map((p: any) => typeof p === 'string' ? p : p.id)
-          : []
-        return people.some((id: string) => excludeFaceIds.indexOf(id) !== -1)
-      }
+      const addedCount = await this.addAssets(album, finalAssetIds)
+      const removedCount = await this.removeExcludedAssets(album, excludeFaceIds, excludedAssetIds)
 
-      if (album.logic === 'OR') {
-        // Fetch all assets for all faceIds, page by page, add to a Set
-        let assetIdSet = new Set<string>()
-        let nextPage: string | null = '1'
-        do {
-          const faceNamesForLog = faceIds.map(getFaceName)
-          this.logger.info(`Fetching page ${nextPage} for faceNames [${faceNamesForLog.join(', ')}]`)
-          const params: any = { metadataSearchDto: { personIds: faceIds, page: parseInt(nextPage, 10), size: PAGE_SIZE } }
-          const result = await searchAssets(params)
-          const items = result.assets?.items || []
-          for (const asset of items) {
-            if (!isExcluded(asset)) assetIdSet.add(asset.id)
-          }
-          this.logger.debug(`Fetched ${items.length} assets for faceNames [${faceNamesForLog.join(', ')}] (page ${nextPage})`)
-          nextPage = result.assets?.nextPage ?? null
-        } while (nextPage !== null)
-        assetIdSets.push(assetIdSet)
-      } else {
-        // AND: For each faceId, fetch all assets, collect IDs in a Set
-        for (const faceId of faceIds) {
-          let assetIdSet = new Set<string>()
-          let nextPage: string | null = '1'
-          const faceNameForLog = getFaceName(faceId)
-          do {
-            this.logger.info(`Fetching page ${nextPage} for faceName [${faceNameForLog}]`)
-            const params: any = { metadataSearchDto: { personIds: [faceId], page: parseInt(nextPage, 10), size: PAGE_SIZE } }
-            const result = await searchAssets(params)
-            const items = result.assets?.items || []
-            for (const asset of items) {
-              if (!isExcluded(asset)) assetIdSet.add(asset.id)
-            }
-            this.logger.debug(`Fetched ${items.length} assets for faceName [${faceNameForLog}] (page ${nextPage})`)
-            nextPage = result.assets?.nextPage ?? null
-          } while (nextPage !== null)
-          assetIdSets.push(assetIdSet)
-        }
-      }
-
-      // Merge/intersect results
-      let finalAssetIds: string[] = []
-      if (album.logic === 'AND') {
-        if (assetIdSets.length > 0) {
-          // Intersect all sets
-          finalAssetIds = Array.from(assetIdSets.reduce((acc, curr) => new Set([...acc].filter(x => curr.has(x)))))
-        }
-        this.logger.info(`AND logic: intersection count = ${finalAssetIds.length}`)
-      } else {
-        // Union
-        finalAssetIds = Array.from(assetIdSets[0] || [])
-        this.logger.info(`OR logic: union count = ${finalAssetIds.length}`)
-      }
-
-      this.logger.info(`Found ${finalAssetIds.length} assets to add to album ${album.name}`)
-      this.logger.debug('Asset IDs:', finalAssetIds)
-
-      let addedCount = 0
-      if (finalAssetIds.length > 0) {
-        await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: finalAssetIds } })
-        this.logger.info(`Added assets to album ${album.name}`)
-        addedCount = finalAssetIds.length
-      } else {
-        this.logger.info('No assets found to add.')
-      }
-
-      // Remove excluded assets already in the album
-      let removedCount = 0
-      if (excludeFaceIds.length > 0) {
-        try {
-          const albumInfo = await (await import('@immich/sdk')).getAlbumInfo({ id: album.albumId })
-          const albumAssets = albumInfo?.assets || []
-          const toRemove = albumAssets.filter(asset => {
-            const people = Array.isArray(asset.people)
-              ? asset.people.map((p: any) => typeof p === 'string' ? p : p.id)
-              : []
-            return people.some((id: string) => excludeFaceIds.indexOf(id) !== -1)
-          })
-          if (toRemove.length > 0) {
-            await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: toRemove.map(a => a.id) } })
-            this.logger.info(`Removed ${toRemove.length} excluded assets from album ${album.name}`)
-            removedCount = toRemove.length
-          }
-        } catch (err) {
-          this.logger.error('Error removing excluded assets from album:', err)
-        }
-      }
-
-      // --- Summary Output ---
-      const summary = {
-        album: album.name,
-        albumId: album.albumId,
-        logic: album.logic,
-        faceNames: album.faceNames,
-        excludeFaceNames: album.excludeFaceNames,
-        addedCount,
-        removedCount
-      }
-      this.logger.info('--- Album Processing Summary ---')
-      this.logger.info(`Album: ${summary.album}`)
-      this.logger.info(`Logic: ${summary.logic}`)
-      this.logger.info(`faceNames: ${summary.faceNames?.join(', ') || ''}`)
-      this.logger.info(`excludeFaceNames: ${summary.excludeFaceNames?.join(', ') || ''}`)
-      this.logger.info(`Assets added: ${summary.addedCount}`)
-      this.logger.info(`Assets removed: ${summary.removedCount}`)
-      this.logger.info('------------------------------')
-      this.logger.debug('Summary object:', summary)
+      this.logSummary(album, addedCount, removedCount)
     } catch (err) {
       this.logger.error('Error processing album', err)
     }
+  }
+
+  /**
+   * Resolves both the include and exclude face name lists for an album into
+   * their corresponding Immich person IDs, and returns reverse-lookup maps for logging.
+   *
+   * @param album - The album whose face name lists should be resolved.
+   * @returns Resolved IDs and name-to-ID maps for both include and exclude lists.
+   */
+  private async resolveAllFaceIds(album: AlbumSettings) {
+    const faceNameToId: Record<string, string> = {}
+    const excludeFaceNameToId: Record<string, string> = {}
+
+    const faceIds = await this.resolveNamesToIds(album.faceNames || [], 'face', faceNameToId)
+    const excludeFaceIds = await this.resolveNamesToIds(album.excludeFaceNames || [], 'exclude face', excludeFaceNameToId)
+
+    return { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId }
+  }
+
+  /**
+   * Resolves a list of human-readable person names to Immich person IDs.
+   * Successful resolutions are stored in the provided `nameToId` map as a side effect.
+   *
+   * @param names     - List of person names to resolve.
+   * @param label     - Human-readable label used in log messages (e.g. `'face'` or `'exclude face'`).
+   * @param nameToId  - Map that will be populated with `name → id` entries for resolved names.
+   * @returns Array of successfully resolved person IDs, in the same order as `names`.
+   */
+  private async resolveNamesToIds(names: string[], label: string, nameToId: Record<string, string>): Promise<string[]> {
+    const ids: string[] = []
+    for (const name of names) {
+      try {
+        const result = await searchPerson({ name })
+        if (result && Array.isArray(result) && result.length > 0) {
+          ids.push(result[0].id)
+          nameToId[name] = result[0].id
+          this.logger.info(`Resolved ${label} name '${name}' to id '${result[0].id}'`)
+        } else {
+          this.logger.info(`No match found for ${label} name '${name}'`)
+        }
+      } catch (err) {
+        this.logger.error(`Error resolving ${label} name '${name}':`, err)
+      }
+    }
+    return ids
+  }
+
+  /**
+   * Builds a function that maps a person ID back to its human-readable name,
+   * falling back to the raw ID if no name is found in either map.
+   *
+   * @param faceNameToId        - Map of include face names to their IDs.
+   * @param excludeFaceNameToId - Map of exclude face names to their IDs.
+   * @returns A lookup function `(id: string) => string`.
+   */
+  private buildFaceNameLookup(
+    faceNameToId: Record<string, string>,
+    excludeFaceNameToId: Record<string, string>
+  ): (id: string) => string {
+    const idToName: Record<string, string> = {}
+    for (const [name, id] of Object.entries(faceNameToId)) idToName[id] = name
+    for (const [name, id] of Object.entries(excludeFaceNameToId)) idToName[id] = name
+    return (id: string) => idToName[id] ?? id
+  }
+
+  /**
+   * Fetches all asset IDs matching the given person IDs across all pages.
+   * Assets whose IDs appear in `excludeSet` are omitted from the result.
+   *
+   * @param personIds  - Immich person IDs to search for.
+   * @param label      - Human-readable label used in log messages.
+   * @param excludeSet - Optional set of asset IDs to exclude from the result.
+   * @returns A `Set` of matching asset IDs.
+   */
+  private async fetchAllAssetIdsForPersons(
+    personIds: string[],
+    label: string,
+    excludeSet: Set<string> = new Set()
+  ): Promise<Set<string>> {
+    const assetIdSet = new Set<string>()
+    let nextPage: any = 1
+
+    do {
+      this.logger.info(`Fetching page ${nextPage} for [${label}]`)
+      const params: any = { metadataSearchDto: { personIds, page: Number(nextPage), size: PAGE_SIZE } }
+      const result = await searchAssets(params)
+      const items = result.assets?.items || []
+
+      for (const asset of items) {
+        if (!excludeSet.has(asset.id)) assetIdSet.add(asset.id)
+      }
+
+      this.logger.debug(`Fetched ${items.length} assets for [${label}] (page ${nextPage})`)
+      nextPage = result.assets?.nextPage ?? null
+    } while (nextPage !== null)
+
+    return assetIdSet
+  }
+
+  /**
+   * Fetches the full set of asset IDs associated with the excluded face IDs.
+   * Returns an empty set if no exclude faces are configured.
+   *
+   * @param excludeFaceIds - Person IDs whose assets should be excluded.
+   * @param getFaceName    - Lookup function for human-readable name logging.
+   * @returns A `Set` of asset IDs belonging to excluded persons.
+   */
+  private async fetchExcludedAssetIds(
+    excludeFaceIds: string[],
+    getFaceName: (id: string) => string
+  ): Promise<Set<string>> {
+    if (excludeFaceIds.length === 0) return new Set()
+
+    const label = excludeFaceIds.map(getFaceName).join(', ')
+    return this.fetchAllAssetIdsForPersons(excludeFaceIds, `exclude: ${label}`)
+  }
+
+  /**
+   * Determines which assets should be added to the album, respecting the
+   * configured `logic` (OR / AND) and filtering out excluded asset IDs.
+   *
+   * @param album            - The album settings (used for `logic` and `faceNames`).
+   * @param faceIds          - Resolved person IDs to include.
+   * @param excludedAssetIds - Asset IDs to omit from the result.
+   * @param getFaceName      - Lookup function for human-readable name logging.
+   * @returns Array of asset IDs to add to the album.
+   */
+  private async collectTargetAssetIds(
+    album: AlbumSettings,
+    faceIds: string[],
+    excludedAssetIds: Set<string>,
+    getFaceName: (id: string) => string
+  ): Promise<string[]> {
+    if (faceIds.length === 0) {
+      if ((album.faceNames || []).length > 0) {
+        this.logger.info(`No valid faceIds found for album '${album.name}', skipping asset search.`)
+      }
+      return []
+    }
+
+    if (album.logic === 'OR') {
+      return this.collectOrAssets(faceIds, excludedAssetIds, getFaceName)
+    } else {
+      return this.collectAndAssets(faceIds, excludedAssetIds, getFaceName)
+    }
+  }
+
+  /**
+   * Collects the union of all assets across all face IDs (OR logic).
+   * A single search covering all `faceIds` at once is used.
+   *
+   * @param faceIds          - Person IDs to include.
+   * @param excludedAssetIds - Asset IDs to omit.
+   * @param getFaceName      - Lookup function for human-readable name logging.
+   * @returns Deduplicated array of asset IDs matching any of the face IDs.
+   */
+  private async collectOrAssets(
+    faceIds: string[],
+    excludedAssetIds: Set<string>,
+    getFaceName: (id: string) => string
+  ): Promise<string[]> {
+    const label = faceIds.map(getFaceName).join(', ')
+    const assetIdSet = await this.fetchAllAssetIdsForPersons(faceIds, label, excludedAssetIds)
+    const result = Array.from(assetIdSet)
+    this.logger.info(`OR logic: union count = ${result.length}`)
+    return result
+  }
+
+  /**
+   * Collects the intersection of assets across all face IDs (AND logic).
+   * Each face ID is queried individually and the results are intersected.
+   *
+   * @param faceIds          - Person IDs that must ALL appear on an asset.
+   * @param excludedAssetIds - Asset IDs to omit before intersecting.
+   * @param getFaceName      - Lookup function for human-readable name logging.
+   * @returns Array of asset IDs matching all face IDs simultaneously.
+   */
+  private async collectAndAssets(
+    faceIds: string[],
+    excludedAssetIds: Set<string>,
+    getFaceName: (id: string) => string
+  ): Promise<string[]> {
+    const perFaceSets: Set<string>[] = []
+
+    for (const faceId of faceIds) {
+      const label = getFaceName(faceId)
+      const assetIdSet = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds)
+      perFaceSets.push(assetIdSet)
+    }
+
+    const intersection = perFaceSets.reduce((acc, curr) => new Set([...acc].filter(x => curr.has(x))))
+    const result = Array.from(intersection)
+    this.logger.info(`AND logic: intersection count = ${result.length}`)
+    return result
+  }
+
+  /**
+   * Adds the given assets to the Immich album.
+   * Does nothing if `assetIds` is empty.
+   *
+   * @param album    - The target album.
+   * @param assetIds - IDs of assets to add.
+   * @returns Number of assets added.
+   */
+  private async addAssets(album: AlbumSettings, assetIds: string[]): Promise<number> {
+    this.logger.info(`Found ${assetIds.length} assets to add to album '${album.name}'`)
+    this.logger.debug('Asset IDs:', assetIds)
+
+    if (assetIds.length === 0) {
+      this.logger.info('No assets found to add.')
+      return 0
+    }
+
+    await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: assetIds } })
+    this.logger.info(`Added ${assetIds.length} assets to album '${album.name}'`)
+    return assetIds.length
+  }
+
+  /**
+   * Removes any assets currently in the album that belong to excluded persons.
+   * Fetches the current album contents and cross-references with `excludedAssetIds`.
+   * Does nothing if no exclude faces are configured.
+   *
+   * @param album            - The target album.
+   * @param excludeFaceIds   - Person IDs whose assets should be removed.
+   * @param excludedAssetIds - Pre-fetched set of asset IDs belonging to excluded persons.
+   * @returns Number of assets removed.
+   */
+  private async removeExcludedAssets(
+    album: AlbumSettings,
+    excludeFaceIds: string[],
+    excludedAssetIds: Set<string>
+  ): Promise<number> {
+    if (excludeFaceIds.length === 0) return 0
+
+    try {
+      const albumInfo = await getAlbumInfo({ id: album.albumId })
+      const albumAssets = albumInfo?.assets || []
+      const toRemove = albumAssets.filter(asset => excludedAssetIds.has(asset.id))
+
+      if (toRemove.length === 0) return 0
+
+      await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: toRemove.map(a => a.id) } })
+      this.logger.info(`Removed ${toRemove.length} excluded assets from album '${album.name}'`)
+      return toRemove.length
+    } catch (err) {
+      this.logger.error('Error removing excluded assets from album:', err)
+      return 0
+    }
+  }
+
+  /**
+   * Logs a header block at the start of album processing.
+   * In `info` mode, key fields are logged individually.
+   * In `debug` mode, the full album object is logged.
+   *
+   * @param album - The album being processed.
+   */
+  private logAlbumHeader(album: AlbumSettings) {
+    this.logger.info(`Processing album: ${album.name}`)
+    if (this.logLevel === 'debug') {
+      this.logger.debug('Album details:', album)
+    } else {
+      this.logger.info(`Logic: ${album.logic}`)
+      this.logger.info(`faceNames: ${album.faceNames?.join(', ') || ''}`)
+      this.logger.info(`excludeFaceNames: ${album.excludeFaceNames?.join(', ') || ''}`)
+    }
+  }
+
+  /**
+   * Logs a structured summary after an album has been processed.
+   *
+   * @param album        - The album that was processed.
+   * @param addedCount   - Number of assets added.
+   * @param removedCount - Number of assets removed.
+   */
+  private logSummary(album: AlbumSettings, addedCount: number, removedCount: number) {
+    this.logger.info('--- Album Processing Summary ---')
+    this.logger.info(`Album: ${album.name}`)
+    this.logger.info(`Logic: ${album.logic}`)
+    this.logger.info(`faceNames: ${album.faceNames?.join(', ') || ''}`)
+    this.logger.info(`excludeFaceNames: ${album.excludeFaceNames?.join(', ') || ''}`)
+    this.logger.info(`Assets added: ${addedCount}`)
+    this.logger.info(`Assets removed: ${removedCount}`)
+    this.logger.info('------------------------------')
+    this.logger.debug('Summary:', { album: album.name, albumId: album.albumId, addedCount, removedCount })
   }
 }
