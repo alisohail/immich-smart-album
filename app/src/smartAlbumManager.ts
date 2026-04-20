@@ -1,13 +1,19 @@
 import { ImmichClient, AlbumSettings, SmartAlbumConfig } from './types'
 import { createLogger } from './utils'
 import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getAlbumInfo } from '@immich/sdk'
+import fs from 'fs'
+import path from 'path'
+import dayjs from 'dayjs'
 
 const PAGE_SIZE = 100
+const LAST_SYNC_FILENAME = '.last-sync'
 
 export class SmartAlbumManager {
   private config: SmartAlbumConfig
   private logger: ReturnType<typeof createLogger>
   private logLevel: 'debug' | 'info'
+  private lastSyncDate: string | null = null
+  private syncFilePath: string
 
   /**
    * @param config - The full smart album configuration, including server URL,
@@ -17,6 +23,8 @@ export class SmartAlbumManager {
     this.config = config
     this.logLevel = config.options?.logLevel || 'info'
     this.logger = createLogger(this.logLevel)
+    const configDir = process.env.CONFIG_DIR || '/config'
+    this.syncFilePath = path.join(configDir, LAST_SYNC_FILENAME)
   }
 
   /**
@@ -24,6 +32,15 @@ export class SmartAlbumManager {
    * and processes every album defined under that user.
    */
   async run() {
+    this.lastSyncDate = this.loadLastSyncDate()
+    const syncStartTime = dayjs().toISOString()
+
+    if (this.lastSyncDate) {
+      this.logger.info(`Incremental sync: fetching assets updated after ${this.lastSyncDate}`)
+    } else {
+      this.logger.info('No previous sync date found, performing full sync')
+    }
+
     for (const user of this.config.users) {
       try {
         init({ baseUrl: this.config.immichServer + '/api', apiKey: user.apiKey })
@@ -34,6 +51,8 @@ export class SmartAlbumManager {
         this.logger.error('User processing failed', err)
       }
     }
+
+    this.saveLastSyncDate(syncStartTime)
   }
 
   /**
@@ -144,8 +163,11 @@ export class SmartAlbumManager {
 
     do {
       this.logger.info(`Fetching page ${nextPage} for [${label}]`)
-      const params: any = { metadataSearchDto: { personIds, page: Number(nextPage), size: PAGE_SIZE } }
-      const result = await searchAssets(params)
+      const dto: any = { personIds, page: Number(nextPage), size: PAGE_SIZE }
+      if (this.lastSyncDate) {
+        dto.updatedAfter = this.lastSyncDate
+      }
+      const result = await searchAssets({ metadataSearchDto: dto })
       const items = result.assets?.items || []
 
       for (const asset of items) {
@@ -346,5 +368,36 @@ export class SmartAlbumManager {
     this.logger.info(`Assets removed: ${removedCount}`)
     this.logger.info('------------------------------')
     this.logger.debug('Summary:', { album: album.name, albumId: album.albumId, addedCount, removedCount })
+  }
+
+  /**
+   * Loads the last sync date from the sync state file.
+   * Returns null if the file does not exist or cannot be read.
+   */
+  private loadLastSyncDate(): string | null {
+    try {
+      if (fs.existsSync(this.syncFilePath)) {
+        const content = fs.readFileSync(this.syncFilePath, 'utf-8').trim()
+        if (content && dayjs(content).isValid()) {
+          return content
+        }
+        this.logger.info('Invalid sync date in state file, will perform full sync')
+      }
+    } catch (err) {
+      this.logger.error('Error reading last sync date:', err)
+    }
+    return null
+  }
+
+  /**
+   * Saves the given ISO date string as the last sync date.
+   */
+  private saveLastSyncDate(date: string): void {
+    try {
+      fs.writeFileSync(this.syncFilePath, date, 'utf-8')
+      this.logger.info(`Saved last sync date: ${date}`)
+    } catch (err) {
+      this.logger.error('Error saving last sync date:', err)
+    }
   }
 }
