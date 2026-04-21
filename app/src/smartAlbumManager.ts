@@ -1,18 +1,18 @@
 import { ImmichClient, AlbumSettings, SmartAlbumConfig } from './types'
 import { createLogger } from './utils'
-import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getAlbumInfo } from '@immich/sdk'
+import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getAlbumInfo, getMyUser } from '@immich/sdk'
 import fs from 'fs'
 import path from 'path'
 import dayjs from 'dayjs'
 
 const PAGE_SIZE = 100
-const LAST_SYNC_FILENAME = '.last-sync'
+const SYNC_STATE_FILENAME = '.sync-state.json'
 
 export class SmartAlbumManager {
   private config: SmartAlbumConfig
   private logger: ReturnType<typeof createLogger>
   private logLevel: 'debug' | 'info'
-  private lastSyncDate: string | null = null
+  private syncState: Record<string, Record<string, Record<string, string>>> = {}
   private syncFilePath: string
 
   /**
@@ -24,7 +24,7 @@ export class SmartAlbumManager {
     this.logLevel = config.options?.logLevel || 'info'
     this.logger = createLogger(this.logLevel)
     const configDir = process.env.CONFIG_DIR || '/config'
-    this.syncFilePath = path.join(configDir, LAST_SYNC_FILENAME)
+    this.syncFilePath = path.join(configDir, SYNC_STATE_FILENAME)
   }
 
   /**
@@ -32,27 +32,24 @@ export class SmartAlbumManager {
    * and processes every album defined under that user.
    */
   async run() {
-    this.lastSyncDate = this.loadLastSyncDate()
+    this.syncState = this.loadSyncState()
     const syncStartTime = dayjs().toISOString()
-
-    if (this.lastSyncDate) {
-      this.logger.info(`Incremental sync: fetching assets updated after ${this.lastSyncDate}`)
-    } else {
-      this.logger.info('No previous sync date found, performing full sync')
-    }
 
     for (const user of this.config.users) {
       try {
         init({ baseUrl: this.config.immichServer + '/api', apiKey: user.apiKey })
+        const userInfo = await getMyUser()
+        const userName = userInfo.name
+        this.logger.info(`Processing user: ${userName}`)
         for (const album of user.albums) {
-          await this.processAlbum(album)
+          await this.processAlbum(userName, album, syncStartTime)
         }
       } catch (err) {
         this.logger.error('User processing failed', err)
       }
     }
 
-    this.saveLastSyncDate(syncStartTime)
+    this.saveSyncState()
   }
 
   /**
@@ -62,7 +59,7 @@ export class SmartAlbumManager {
    *
    * @param album - The album settings to process.
    */
-  async processAlbum(album: AlbumSettings) {
+  async processAlbum(userName: string, album: AlbumSettings, syncStartTime: string) {
     const { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId } = await this.resolveAllFaceIds(album)
     const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
@@ -70,10 +67,17 @@ export class SmartAlbumManager {
 
     try {
       const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
-      const finalAssetIds = await this.collectTargetAssetIds(album, faceIds, excludedAssetIds, getFaceName)
+      const finalAssetIds = await this.collectTargetAssetIds(userName, album, faceIds, excludedAssetIds, getFaceName)
 
       const addedCount = await this.addAssets(album, finalAssetIds)
       const removedCount = await this.removeExcludedAssets(album, excludeFaceIds, excludedAssetIds)
+
+      // Update sync state for each face in this album after successful processing
+      for (const faceId of faceIds) {
+        if (!this.syncState[userName]) this.syncState[userName] = {}
+        if (!this.syncState[userName][album.name]) this.syncState[userName][album.name] = {}
+        this.syncState[userName][album.name][getFaceName(faceId)] = syncStartTime
+      }
 
       this.logSummary(album, addedCount, removedCount)
     } catch (err) {
@@ -156,16 +160,23 @@ export class SmartAlbumManager {
   private async fetchAllAssetIdsForPersons(
     personIds: string[],
     label: string,
-    excludeSet: Set<string> = new Set()
+    excludeSet: Set<string> = new Set(),
+    updatedAfter?: string | null
   ): Promise<Set<string>> {
     const assetIdSet = new Set<string>()
     let nextPage: any = 1
 
+    if (updatedAfter) {
+      this.logger.info(`Incremental fetch for [${label}]: assets updated after ${updatedAfter}`)
+    } else {
+      this.logger.info(`Full fetch for [${label}]`)
+    }
+
     do {
       this.logger.info(`Fetching page ${nextPage} for [${label}]`)
       const dto: any = { personIds, page: Number(nextPage), size: PAGE_SIZE }
-      if (this.lastSyncDate) {
-        dto.updatedAfter = this.lastSyncDate
+      if (updatedAfter) {
+        dto.updatedAfter = updatedAfter
       }
       const result = await searchAssets({ metadataSearchDto: dto })
       const items = result.assets?.items || []
@@ -210,6 +221,7 @@ export class SmartAlbumManager {
    * @returns Array of asset IDs to add to the album.
    */
   private async collectTargetAssetIds(
+    userName: string,
     album: AlbumSettings,
     faceIds: string[],
     excludedAssetIds: Set<string>,
@@ -223,9 +235,9 @@ export class SmartAlbumManager {
     }
 
     if (album.logic === 'OR') {
-      return this.collectOrAssets(faceIds, excludedAssetIds, getFaceName)
+      return this.collectOrAssets(userName, album, faceIds, excludedAssetIds, getFaceName)
     } else {
-      return this.collectAndAssets(faceIds, excludedAssetIds, getFaceName)
+      return this.collectAndAssets(userName, album, faceIds, excludedAssetIds, getFaceName)
     }
   }
 
@@ -239,13 +251,22 @@ export class SmartAlbumManager {
    * @returns Deduplicated array of asset IDs matching any of the face IDs.
    */
   private async collectOrAssets(
+    userName: string,
+    album: AlbumSettings,
     faceIds: string[],
     excludedAssetIds: Set<string>,
     getFaceName: (id: string) => string
   ): Promise<string[]> {
-    const label = faceIds.map(getFaceName).join(', ')
-    const assetIdSet = await this.fetchAllAssetIdsForPersons(faceIds, label, excludedAssetIds)
-    const result = Array.from(assetIdSet)
+    const combined = new Set<string>()
+
+    for (const faceId of faceIds) {
+      const label = getFaceName(faceId)
+      const syncDate = this.syncState[userName]?.[album.name]?.[label] || null
+      const assets = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
+      for (const id of assets) combined.add(id)
+    }
+
+    const result = Array.from(combined)
     this.logger.info(`OR logic: union count = ${result.length}`)
     return result
   }
@@ -260,15 +281,26 @@ export class SmartAlbumManager {
    * @returns Array of asset IDs matching all face IDs simultaneously.
    */
   private async collectAndAssets(
+    userName: string,
+    album: AlbumSettings,
     faceIds: string[],
     excludedAssetIds: Set<string>,
     getFaceName: (id: string) => string
   ): Promise<string[]> {
+    // For AND logic, if any face is new (no sync date), we must do a full
+    // sync for ALL faces — an incremental fetch on old faces would miss
+    // historical assets that now match the full intersection.
+    const anyNew = faceIds.some(id => !this.syncState[userName]?.[album.name]?.[getFaceName(id)])
+    if (anyNew) {
+      this.logger.info('AND logic: new face detected, performing full sync for all faces in this album')
+    }
+
     const perFaceSets: Set<string>[] = []
 
     for (const faceId of faceIds) {
       const label = getFaceName(faceId)
-      const assetIdSet = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds)
+      const syncDate = anyNew ? null : (this.syncState[userName]?.[album.name]?.[label] || null)
+      const assetIdSet = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
       perFaceSets.push(assetIdSet)
     }
 
@@ -370,34 +402,31 @@ export class SmartAlbumManager {
     this.logger.debug('Summary:', { album: album.name, albumId: album.albumId, addedCount, removedCount })
   }
 
-  /**
-   * Loads the last sync date from the sync state file.
-   * Returns null if the file does not exist or cannot be read.
-   */
-  private loadLastSyncDate(): string | null {
+  private loadSyncState(): Record<string, Record<string, Record<string, string>>> {
     try {
       if (fs.existsSync(this.syncFilePath)) {
         const content = fs.readFileSync(this.syncFilePath, 'utf-8').trim()
-        if (content && dayjs(content).isValid()) {
-          return content
+        const parsed = JSON.parse(content)
+        if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+          const userCount = Object.keys(parsed).length
+          this.logger.info(`Loaded sync state with ${userCount} user(s)`)
+          return parsed
         }
-        this.logger.info('Invalid sync date in state file, will perform full sync')
+        this.logger.info('Invalid sync state file, starting fresh')
       }
     } catch (err) {
-      this.logger.error('Error reading last sync date:', err)
+      this.logger.error('Error reading sync state:', err)
     }
-    return null
+    return {}
   }
 
-  /**
-   * Saves the given ISO date string as the last sync date.
-   */
-  private saveLastSyncDate(date: string): void {
+  private saveSyncState(): void {
     try {
-      fs.writeFileSync(this.syncFilePath, date, 'utf-8')
-      this.logger.info(`Saved last sync date: ${date}`)
+      fs.writeFileSync(this.syncFilePath, JSON.stringify(this.syncState, null, 2), 'utf-8')
+      const userCount = Object.keys(this.syncState).length
+      this.logger.info(`Saved sync state with ${userCount} user(s)`)
     } catch (err) {
-      this.logger.error('Error saving last sync date:', err)
+      this.logger.error('Error saving sync state:', err)
     }
   }
 }
