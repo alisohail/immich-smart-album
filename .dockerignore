@@ -6,3 +6,4 @@ app/dist
 .env
 config
 README*.md
+config/.sync-state.json
