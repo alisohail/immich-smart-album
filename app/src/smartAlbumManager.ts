@@ -1,6 +1,6 @@
 import { ImmichClient, AlbumSettings, SmartAlbumConfig } from './types'
 import { createLogger } from './utils'
-import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getAlbumInfo, getMyUser } from '@immich/sdk'
+import { AssetResponseDto, init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getMyUser } from '@immich/sdk'
 import fs from 'fs'
 import path from 'path'
 import dayjs from 'dayjs'
@@ -14,6 +14,7 @@ export class SmartAlbumManager {
   private logLevel: 'debug' | 'info'
   private syncState: Record<string, Record<string, Record<string, string>>> = {}
   private syncFilePath: string
+  private runAlbumChecksums = new Map<string, Set<string>>()
 
   /**
    * @param config - The full smart album configuration, including server URL,
@@ -33,7 +34,7 @@ export class SmartAlbumManager {
    */
   async run() {
     this.syncState = this.loadSyncState()
-    const syncStartTime = dayjs().toISOString()
+    this.runAlbumChecksums = new Map() // reset per run — shared across users for cross-user dedup
 
     for (const user of this.config.users) {
       try {
@@ -42,7 +43,7 @@ export class SmartAlbumManager {
         const userName = userInfo.name
         this.logger.info(`Processing user: ${userName}`)
         for (const album of user.albums) {
-          await this.processAlbum(userName, album, syncStartTime)
+          await this.processAlbum(userName, album)
         }
       } catch (err) {
         this.logger.error('User processing failed', err)
@@ -59,18 +60,31 @@ export class SmartAlbumManager {
    *
    * @param album - The album settings to process.
    */
-  async processAlbum(userName: string, album: AlbumSettings, syncStartTime: string) {
+  async processAlbum(userName: string, album: AlbumSettings) {
     const { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId } = await this.resolveAllFaceIds(album)
     const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
     this.logAlbumHeader(album)
 
+    // Capture start time per-album so that photos uploaded during a long multi-album
+    // run are not missed. Using a shared run-level timestamp would make the stored
+    // sync date stale for albums processed later in the same run.
+    const syncStartTime = dayjs().toISOString()
+
     try {
       const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
-      const finalAssetIds = await this.collectTargetAssetIds(userName, album, faceIds, excludedAssetIds, getFaceName)
+      const candidateAssets = await this.collectTargetAssetIds(userName, album, faceIds, excludedAssetIds, getFaceName)
 
-      const addedCount = await this.addAssets(album, finalAssetIds)
-      const removedCount = await this.removeExcludedAssets(album, excludeFaceIds, excludedAssetIds)
+      // Only fetch existing checksums when we have candidates AND multiple users are configured.
+      // We query only the face-matched assets already in the album (albumIds + personIds), not all album assets.
+      // For a 100k-photo album with 500 Alice photos, this is ~5 API calls instead of ~1000.
+      const needsDedup = candidateAssets.size > 0 && this.config.users.length > 1
+      const existingChecksums = needsDedup
+        ? await this.fetchFaceChecksumsInAlbum(album.albumId)
+        : new Set<string>()
+
+      const addedCount = await this.addAssets(album, candidateAssets, existingChecksums)
+      const removedCount = await this.removeExcludedAssets(album, excludeFaceIds)
 
       // Update sync state for each face in this album after successful processing
       for (const faceId of faceIds) {
@@ -96,8 +110,10 @@ export class SmartAlbumManager {
     const faceNameToId: Record<string, string> = {}
     const excludeFaceNameToId: Record<string, string> = {}
 
-    const faceIds = await this.resolveNamesToIds(album.faceNames || [], 'face', faceNameToId)
-    const excludeFaceIds = await this.resolveNamesToIds(album.excludeFaceNames || [], 'exclude face', excludeFaceNameToId)
+    const [faceIds, excludeFaceIds] = await Promise.all([
+      this.resolveNamesToIds(album.faceNames || [], 'face', faceNameToId),
+      this.resolveNamesToIds(album.excludeFaceNames || [], 'exclude face', excludeFaceNameToId),
+    ])
 
     return { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId }
   }
@@ -112,22 +128,24 @@ export class SmartAlbumManager {
    * @returns Array of successfully resolved person IDs, in the same order as `names`.
    */
   private async resolveNamesToIds(names: string[], label: string, nameToId: Record<string, string>): Promise<string[]> {
-    const ids: string[] = []
-    for (const name of names) {
-      try {
-        const result = await searchPerson({ name })
-        if (result && Array.isArray(result) && result.length > 0) {
-          ids.push(result[0].id)
-          nameToId[name] = result[0].id
-          this.logger.info(`Resolved ${label} name '${name}' to id '${result[0].id}'`)
-        } else {
+    const results = await Promise.all(
+      names.map(async (name) => {
+        try {
+          const result = await searchPerson({ name })
+          if (result && Array.isArray(result) && result.length > 0) {
+            nameToId[name] = result[0].id
+            this.logger.info(`Resolved ${label} name '${name}' to id '${result[0].id}'`)
+            return result[0].id as string | null
+          }
           this.logger.info(`No match found for ${label} name '${name}'`)
+          return null
+        } catch (err) {
+          this.logger.error(`Error resolving ${label} name '${name}':`, err)
+          return null
         }
-      } catch (err) {
-        this.logger.error(`Error resolving ${label} name '${name}':`, err)
-      }
-    }
-    return ids
+      })
+    )
+    return results.filter((id): id is string => id !== null)
   }
 
   /**
@@ -148,6 +166,36 @@ export class SmartAlbumManager {
     return (id: string) => idToName[id] ?? id
   }
 
+  private async fetchFaceChecksumsInAlbum(albumId: string): Promise<Set<string>> {
+    // Return cached set if this album has already been loaded this run.
+    // The Set is shared — addAssets mutates it in-place, so checksums added by
+    // earlier users are automatically visible to later users in the same run.
+    if (this.runAlbumChecksums.has(albumId)) {
+      this.logger.debug(`Using cached album checksums for dedup (${this.runAlbumChecksums.get(albumId)!.size} entries)`)
+      return this.runAlbumChecksums.get(albumId)!
+    }
+
+    // Full paginated fetch — face-filtered queries can't be used here because other
+    // users' photos are tagged with their own person IDs, not the current user's.
+    // This is paid once per album per run, not once per user.
+    const checksums = new Set<string>()
+    let nextPage: any = 1
+
+    do {
+      const result = await searchAssets({
+        metadataSearchDto: { albumIds: [albumId], page: Number(nextPage), size: PAGE_SIZE }
+      })
+      const items = result.assets?.items || []
+      for (const asset of items) checksums.add(asset.checksum)
+      this.logger.debug(`Fetched ${items.length} album assets for dedup cache (page ${nextPage})`)
+      nextPage = result.assets?.nextPage ?? null
+    } while (nextPage !== null)
+
+    this.logger.info(`Loaded ${checksums.size} existing album checksums for cross-user dedup`)
+    this.runAlbumChecksums.set(albumId, checksums)
+    return checksums
+  }
+
   /**
    * Fetches all asset IDs matching the given person IDs across all pages.
    * Assets whose IDs appear in `excludeSet` are omitted from the result.
@@ -162,8 +210,8 @@ export class SmartAlbumManager {
     label: string,
     excludeSet: Set<string> = new Set(),
     updatedAfter?: string | null
-  ): Promise<Set<string>> {
-    const assetIdSet = new Set<string>()
+  ): Promise<Map<string, string>> {
+    const assetMap = new Map<string, string>() // Map<assetId, checksum>
     let nextPage: any = 1
 
     if (updatedAfter) {
@@ -182,14 +230,14 @@ export class SmartAlbumManager {
       const items = result.assets?.items || []
 
       for (const asset of items) {
-        if (!excludeSet.has(asset.id)) assetIdSet.add(asset.id)
+        if (!excludeSet.has(asset.id)) assetMap.set(asset.id, asset.checksum)
       }
 
       this.logger.debug(`Fetched ${items.length} assets for [${label}] (page ${nextPage})`)
       nextPage = result.assets?.nextPage ?? null
     } while (nextPage !== null)
 
-    return assetIdSet
+    return assetMap
   }
 
   /**
@@ -207,7 +255,8 @@ export class SmartAlbumManager {
     if (excludeFaceIds.length === 0) return new Set()
 
     const label = excludeFaceIds.map(getFaceName).join(', ')
-    return this.fetchAllAssetIdsForPersons(excludeFaceIds, `exclude: ${label}`)
+    const assetMap = await this.fetchAllAssetIdsForPersons(excludeFaceIds, `exclude: ${label}`)
+    return new Set(assetMap.keys())
   }
 
   /**
@@ -226,12 +275,12 @@ export class SmartAlbumManager {
     faceIds: string[],
     excludedAssetIds: Set<string>,
     getFaceName: (id: string) => string
-  ): Promise<string[]> {
+  ): Promise<Map<string, string>> {
     if (faceIds.length === 0) {
       if ((album.faceNames || []).length > 0) {
         this.logger.info(`No valid faceIds found for album '${album.name}', skipping asset search.`)
       }
-      return []
+      return new Map()
     }
 
     if (album.logic === 'OR') {
@@ -256,19 +305,27 @@ export class SmartAlbumManager {
     faceIds: string[],
     excludedAssetIds: Set<string>,
     getFaceName: (id: string) => string
-  ): Promise<string[]> {
-    const combined = new Set<string>()
+  ): Promise<Map<string, string>> {
+    const combined = new Map<string, string>()
 
+    // Group faces by their sync date so faces with the same date can be
+    // fetched in a single API call instead of N separate calls.
+    const groups = new Map<string | null, string[]>()
     for (const faceId of faceIds) {
-      const label = getFaceName(faceId)
-      const syncDate = this.syncState[userName]?.[album.name]?.[label] || null
-      const assets = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
-      for (const id of assets) combined.add(id)
+      const syncDate = this.syncState[userName]?.[album.name]?.[getFaceName(faceId)] || null
+      const group = groups.get(syncDate) ?? []
+      group.push(faceId)
+      groups.set(syncDate, group)
     }
 
-    const result = Array.from(combined)
-    this.logger.info(`OR logic: union count = ${result.length}`)
-    return result
+    for (const [syncDate, groupFaceIds] of groups) {
+      const label = groupFaceIds.map(getFaceName).join(', ')
+      const assets = await this.fetchAllAssetIdsForPersons(groupFaceIds, label, excludedAssetIds, syncDate)
+      for (const [id, checksum] of assets) combined.set(id, checksum)
+    }
+
+    this.logger.info(`OR logic: union count = ${combined.size}`)
+    return combined
   }
 
   /**
@@ -286,7 +343,7 @@ export class SmartAlbumManager {
     faceIds: string[],
     excludedAssetIds: Set<string>,
     getFaceName: (id: string) => string
-  ): Promise<string[]> {
+  ): Promise<Map<string, string>> {
     // For AND logic, if any face is new (no sync date), we must do a full
     // sync for ALL faces — an incremental fetch on old faces would miss
     // historical assets that now match the full intersection.
@@ -295,18 +352,20 @@ export class SmartAlbumManager {
       this.logger.info('AND logic: new face detected, performing full sync for all faces in this album')
     }
 
-    const perFaceSets: Set<string>[] = []
+    const perFaceMaps: Map<string, string>[] = []
 
     for (const faceId of faceIds) {
       const label = getFaceName(faceId)
       const syncDate = anyNew ? null : (this.syncState[userName]?.[album.name]?.[label] || null)
-      const assetIdSet = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
-      perFaceSets.push(assetIdSet)
+      const assetMap = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
+      perFaceMaps.push(assetMap)
     }
 
-    const intersection = perFaceSets.reduce((acc, curr) => new Set([...acc].filter(x => curr.has(x))))
-    const result = Array.from(intersection)
-    this.logger.info(`AND logic: intersection count = ${result.length}`)
+    const [first, ...rest] = perFaceMaps
+    const intersectedIds = [...first.keys()].filter(id => rest.every(m => m.has(id)))
+    const result = new Map<string, string>()
+    for (const id of intersectedIds) result.set(id, first.get(id)!)
+    this.logger.info(`AND logic: intersection count = ${result.size}`)
     return result
   }
 
@@ -318,18 +377,39 @@ export class SmartAlbumManager {
    * @param assetIds - IDs of assets to add.
    * @returns Number of assets added.
    */
-  private async addAssets(album: AlbumSettings, assetIds: string[]): Promise<number> {
-    this.logger.info(`Found ${assetIds.length} assets to add to album '${album.name}'`)
-    this.logger.debug('Asset IDs:', assetIds)
+  private async addAssets(
+    album: AlbumSettings,
+    candidates: Map<string, string>,
+    existingChecksums: Set<string>
+  ): Promise<number> {
 
-    if (assetIds.length === 0) {
-      this.logger.info('No assets found to add.')
+    const toAdd: string[] = []
+    let skippedDuplicates = 0
+
+    for (const [id, checksum] of candidates) {
+      if (existingChecksums.has(checksum)) {
+        skippedDuplicates++
+      } else {
+        toAdd.push(id)
+        existingChecksums.add(checksum)
+      }
+    }
+
+    if (skippedDuplicates > 0) {
+      this.logger.info(`Skipped ${skippedDuplicates} cross-user duplicate(s) already in album '${album.name}'`)
+    }
+
+    this.logger.info(`Found ${toAdd.length} new assets to add to album '${album.name}'`)
+    this.logger.debug('Asset IDs to add:', toAdd)
+
+    if (toAdd.length === 0) {
+      this.logger.info('No new assets to add.')
       return 0
     }
 
-    await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: assetIds } })
-    this.logger.info(`Added ${assetIds.length} assets to album '${album.name}'`)
-    return assetIds.length
+    await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: toAdd } })
+    this.logger.info(`Added ${toAdd.length} assets to album '${album.name}'`)
+    return toAdd.length
   }
 
   /**
@@ -344,24 +424,34 @@ export class SmartAlbumManager {
    */
   private async removeExcludedAssets(
     album: AlbumSettings,
-    excludeFaceIds: string[],
-    excludedAssetIds: Set<string>
+    excludeFaceIds: string[]
   ): Promise<number> {
     if (excludeFaceIds.length === 0) return 0
 
     try {
-      const albumInfo = await getAlbumInfo({ id: album.albumId })
-      const albumAssets = albumInfo?.assets || []
-      const toRemove = albumAssets.filter(asset => excludedAssetIds.has(asset.id))
+      // Query the intersection of (album assets) ∩ (excluded-face assets) directly.
+      // This avoids loading all album assets just to filter them locally.
+      const toRemove: string[] = []
+      let nextPage: any = 1
+
+      do {
+        const result = await searchAssets({
+          metadataSearchDto: { albumIds: [album.albumId], personIds: excludeFaceIds, page: Number(nextPage), size: PAGE_SIZE }
+        })
+        const items = result.assets?.items || []
+        toRemove.push(...items.map((a: AssetResponseDto) => a.id))
+        this.logger.debug(`Fetched ${items.length} excluded assets in album (page ${nextPage})`)
+        nextPage = result.assets?.nextPage ?? null
+      } while (nextPage !== null)
 
       if (toRemove.length === 0) return 0
 
-      await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: toRemove.map(a => a.id) } })
+      await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: toRemove } })
       this.logger.info(`Removed ${toRemove.length} excluded assets from album '${album.name}'`)
       return toRemove.length
     } catch (err) {
       this.logger.error('Error removing excluded assets from album:', err)
-      return 0
+      throw err
     }
   }
 

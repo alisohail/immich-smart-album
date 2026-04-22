@@ -16,10 +16,27 @@ import { SmartAlbumConfig } from './types'
 export function loadConfig(): SmartAlbumConfig {
   const configDir = process.env.CONFIG_DIR || '/config'
   const configPath = process.env.SMART_ALBUM_CONFIG || path.join(configDir, 'config.json')
+  let config: SmartAlbumConfig
   try {
     const raw = fs.readFileSync(configPath, 'utf-8')
-    return JSON.parse(raw)
+    config = JSON.parse(raw)
   } catch (err) {
     throw new Error('Failed to load config: ' + err)
   }
+
+  const allNames = config.users.flatMap(u => u.albums.map(a => a.name))
+  const seen = new Set<string>()
+  for (const name of allNames) {
+    if (seen.has(name)) throw new Error(`Duplicate album name in config: "${name}". Album names must be unique across all users as they are used as sync state keys.`)
+    seen.add(name)
+  }
+
+  const allAlbumIds = config.users.flatMap(u => u.albums.map(a => a.albumId))
+  const seenIds = new Set<string>()
+  for (const id of allAlbumIds) {
+    if (seenIds.has(id)) throw new Error(`Duplicate albumId in config: "${id}". Each album entry must reference a distinct Immich album.`)
+    seenIds.add(id)
+  }
+
+  return config
 }
