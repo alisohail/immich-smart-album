@@ -6,6 +6,7 @@
  */
 import { SmartAlbumManager } from './smartAlbumManager'
 import { loadConfig } from './smartConfig'
+import { createLogger } from './utils'
 import cron from 'node-cron'
 import dayjs from 'dayjs'
 
@@ -22,10 +23,10 @@ async function main() {
   try {
     const config = loadConfig()
     const manager = new SmartAlbumManager(config)
+    const logger = createLogger(config.options?.logLevel || 'info')
 
     // Default to "every 30 minutes" if no schedule is configured
     const schedule = config.schedule || '0,30 * * * *'
-    const logger = manager['logger']
 
     const cronTask = cron.schedule(schedule, async () => {
       await manager.run()

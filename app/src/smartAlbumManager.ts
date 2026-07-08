@@ -15,6 +15,7 @@ export class SmartAlbumManager {
   private syncState: Record<string, Record<string, Record<string, string>>> = {}
   private syncFilePath: string
   private runAlbumChecksums = new Map<string, Set<string>>()
+  private running = false
 
   /**
    * @param config - The full smart album configuration, including server URL,
@@ -28,11 +29,24 @@ export class SmartAlbumManager {
     this.syncFilePath = path.join(configDir, SYNC_STATE_FILENAME)
   }
 
+  get log() {
+    return this.logger
+  }
+
   /**
    * Iterates over all configured users, initialises the Immich SDK for each,
    * and processes every album defined under that user.
    */
   async run() {
+    if (this.running) {
+      this.logger.warn('Previous sync still in progress — skipping this scheduled run')
+      return
+    }
+    this.running = true
+    const runStart = dayjs()
+    const totalAlbums = this.config.users.reduce((sum, u) => sum + u.albums.length, 0)
+    this.logger.info(`Sync started — ${runStart.format('YYYY-MM-DD HH:mm:ss')} | ${this.config.users.length} user(s), ${totalAlbums} album(s)`)
+
     this.syncState = this.loadSyncState()
     this.runAlbumChecksums = new Map() // reset per run — shared across users for cross-user dedup
 
@@ -40,17 +54,20 @@ export class SmartAlbumManager {
       try {
         init({ baseUrl: this.config.immichServer + '/api', apiKey: user.apiKey })
         const userInfo = await getMyUser()
-        const userName = userInfo.name
-        this.logger.info(`Processing user: ${userName}`)
+        const userId = userInfo.id    // stable UUID — used as sync state key
+        const userName = userInfo.name // display name — used only for logging
+        this.logger.info(`User: ${userName}`)
         for (const album of user.albums) {
-          await this.processAlbum(userName, album)
+          await this.processAlbum(userId, userName, album)
         }
       } catch (err) {
-        this.logger.error('User processing failed', err)
+        this.logger.error('User processing failed:', err)
       }
     }
 
-    this.saveSyncState()
+    const elapsed = dayjs().diff(runStart, 'second')
+    this.logger.info(`Sync complete — ${elapsed}s elapsed`)
+    this.running = false
   }
 
   /**
@@ -60,11 +77,22 @@ export class SmartAlbumManager {
    *
    * @param album - The album settings to process.
    */
-  async processAlbum(userName: string, album: AlbumSettings) {
+  async processAlbum(userId: string, userName: string, album: AlbumSettings) {
     const { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId } = await this.resolveAllFaceIds(album)
     const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
-    this.logAlbumHeader(album)
+    // Single compact header line: "Family" [OR] | faces: Alice, Bob | exclude: Eve
+    const facesDisplay = (album.faceNames || []).join(', ') || '(none)'
+    const excludeDisplay = (album.excludeFaceNames || []).length > 0
+      ? `  |  exclude: ${(album.excludeFaceNames || []).join(', ')}`
+      : ''
+    this.logger.info(`  "${album.name}"  [${album.logic}]  |  faces: ${facesDisplay}${excludeDisplay}`)
+
+    // Warn if face names were configured but none could be resolved in Immich.
+    if (faceIds.length === 0 && (album.faceNames || []).length > 0) {
+      this.logger.warn(`    No faces resolved — check face names match Immich exactly`)
+      return
+    }
 
     // Capture start time per-album so that photos uploaded during a long multi-album
     // run are not missed. Using a shared run-level timestamp would make the stored
@@ -73,7 +101,7 @@ export class SmartAlbumManager {
 
     try {
       const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
-      const candidateAssets = await this.collectTargetAssetIds(userName, album, faceIds, excludedAssetIds, getFaceName)
+      const candidateAssets = await this.collectTargetAssetIds(userId, album, faceIds, excludedAssetIds, getFaceName)
 
       // Only fetch existing checksums when we have candidates AND multiple users are configured.
       // We query only the face-matched assets already in the album (albumIds + personIds), not all album assets.
@@ -83,19 +111,28 @@ export class SmartAlbumManager {
         ? await this.fetchFaceChecksumsInAlbum(album.albumId)
         : new Set<string>()
 
-      const addedCount = await this.addAssets(album, candidateAssets, existingChecksums)
+      const { added, skipped } = await this.addAssets(album, candidateAssets, existingChecksums)
       const removedCount = await this.removeExcludedAssets(album, excludeFaceIds)
 
-      // Update sync state for each face in this album after successful processing
+      // Update sync state for each face in this album after successful processing.
+      // Keyed by stable userId (UUID) — not display name, which can change in Immich.
       for (const faceId of faceIds) {
-        if (!this.syncState[userName]) this.syncState[userName] = {}
-        if (!this.syncState[userName][album.name]) this.syncState[userName][album.name] = {}
-        this.syncState[userName][album.name][getFaceName(faceId)] = syncStartTime
+        if (!this.syncState[userId]) this.syncState[userId] = {}
+        if (!this.syncState[userId][album.name]) this.syncState[userId][album.name] = {}
+        this.syncState[userId][album.name][getFaceName(faceId)] = syncStartTime
       }
 
-      this.logSummary(album, addedCount, removedCount)
+      // Save after each successful album so progress is not lost if the process crashes.
+      this.saveSyncState()
+
+      // Single compact result line
+      const parts: string[] = []
+      if (added > 0) parts.push(`+${added} added`)
+      if (removedCount > 0) parts.push(`-${removedCount} removed`)
+      if (skipped > 0) parts.push(`${skipped} duplicate(s) skipped`)
+      this.logger.info(`    → ${parts.length > 0 ? parts.join(', ') : 'nothing to sync'}`)
     } catch (err) {
-      this.logger.error('Error processing album', err)
+      this.logger.error(`    → Failed processing "${album.name}":`, err)
     }
   }
 
@@ -134,10 +171,10 @@ export class SmartAlbumManager {
           const result = await searchPerson({ name })
           if (result && Array.isArray(result) && result.length > 0) {
             nameToId[name] = result[0].id
-            this.logger.info(`Resolved ${label} name '${name}' to id '${result[0].id}'`)
+            this.logger.debug(`Resolved ${label} name '${name}' to id '${result[0].id}'`)
             return result[0].id as string | null
           }
-          this.logger.info(`No match found for ${label} name '${name}'`)
+          this.logger.warn(`    "${name}" not found in Immich — skipping`)
           return null
         } catch (err) {
           this.logger.error(`Error resolving ${label} name '${name}':`, err)
@@ -191,7 +228,7 @@ export class SmartAlbumManager {
       nextPage = result.assets?.nextPage ?? null
     } while (nextPage !== null)
 
-    this.logger.info(`Loaded ${checksums.size} existing album checksums for cross-user dedup`)
+    this.logger.debug(`Loaded ${checksums.size} existing album checksums for cross-user dedup`)
     this.runAlbumChecksums.set(albumId, checksums)
     return checksums
   }
@@ -215,13 +252,13 @@ export class SmartAlbumManager {
     let nextPage: any = 1
 
     if (updatedAfter) {
-      this.logger.info(`Incremental fetch for [${label}]: assets updated after ${updatedAfter}`)
+      this.logger.debug(`Incremental fetch for [${label}]: assets updated after ${updatedAfter}`)
     } else {
-      this.logger.info(`Full fetch for [${label}]`)
+      this.logger.debug(`Full fetch for [${label}]`)
     }
 
     do {
-      this.logger.info(`Fetching page ${nextPage} for [${label}]`)
+      this.logger.debug(`Fetching page ${nextPage} for [${label}]`)
       const dto: any = { personIds, page: Number(nextPage), size: PAGE_SIZE }
       if (updatedAfter) {
         dto.updatedAfter = updatedAfter
@@ -270,7 +307,7 @@ export class SmartAlbumManager {
    * @returns Array of asset IDs to add to the album.
    */
   private async collectTargetAssetIds(
-    userName: string,
+    userId: string,
     album: AlbumSettings,
     faceIds: string[],
     excludedAssetIds: Set<string>,
@@ -278,15 +315,15 @@ export class SmartAlbumManager {
   ): Promise<Map<string, string>> {
     if (faceIds.length === 0) {
       if ((album.faceNames || []).length > 0) {
-        this.logger.info(`No valid faceIds found for album '${album.name}', skipping asset search.`)
+        this.logger.debug(`No valid faceIds found for album '${album.name}', skipping asset search.`)
       }
       return new Map()
     }
 
     if (album.logic === 'OR') {
-      return this.collectOrAssets(userName, album, faceIds, excludedAssetIds, getFaceName)
+      return this.collectOrAssets(userId, album, faceIds, excludedAssetIds, getFaceName)
     } else {
-      return this.collectAndAssets(userName, album, faceIds, excludedAssetIds, getFaceName)
+      return this.collectAndAssets(userId, album, faceIds, excludedAssetIds, getFaceName)
     }
   }
 
@@ -300,7 +337,7 @@ export class SmartAlbumManager {
    * @returns Deduplicated array of asset IDs matching any of the face IDs.
    */
   private async collectOrAssets(
-    userName: string,
+    userId: string,
     album: AlbumSettings,
     faceIds: string[],
     excludedAssetIds: Set<string>,
@@ -312,7 +349,7 @@ export class SmartAlbumManager {
     // fetched in a single API call instead of N separate calls.
     const groups = new Map<string | null, string[]>()
     for (const faceId of faceIds) {
-      const syncDate = this.syncState[userName]?.[album.name]?.[getFaceName(faceId)] || null
+      const syncDate = this.syncState[userId]?.[album.name]?.[getFaceName(faceId)] || null
       const group = groups.get(syncDate) ?? []
       group.push(faceId)
       groups.set(syncDate, group)
@@ -324,7 +361,7 @@ export class SmartAlbumManager {
       for (const [id, checksum] of assets) combined.set(id, checksum)
     }
 
-    this.logger.info(`OR logic: union count = ${combined.size}`)
+    this.logger.debug(`OR logic: union count = ${combined.size}`)
     return combined
   }
 
@@ -338,7 +375,7 @@ export class SmartAlbumManager {
    * @returns Array of asset IDs matching all face IDs simultaneously.
    */
   private async collectAndAssets(
-    userName: string,
+    userId: string,
     album: AlbumSettings,
     faceIds: string[],
     excludedAssetIds: Set<string>,
@@ -347,16 +384,16 @@ export class SmartAlbumManager {
     // For AND logic, if any face is new (no sync date), we must do a full
     // sync for ALL faces — an incremental fetch on old faces would miss
     // historical assets that now match the full intersection.
-    const anyNew = faceIds.some(id => !this.syncState[userName]?.[album.name]?.[getFaceName(id)])
+    const anyNew = faceIds.some(id => !this.syncState[userId]?.[album.name]?.[getFaceName(id)])
     if (anyNew) {
-      this.logger.info('AND logic: new face detected, performing full sync for all faces in this album')
+      this.logger.debug('AND logic: new face detected, performing full sync for all faces in this album')
     }
 
     const perFaceMaps: Map<string, string>[] = []
 
     for (const faceId of faceIds) {
       const label = getFaceName(faceId)
-      const syncDate = anyNew ? null : (this.syncState[userName]?.[album.name]?.[label] || null)
+      const syncDate = anyNew ? null : (this.syncState[userId]?.[album.name]?.[label] || null)
       const assetMap = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
       perFaceMaps.push(assetMap)
     }
@@ -365,7 +402,7 @@ export class SmartAlbumManager {
     const intersectedIds = [...first.keys()].filter(id => rest.every(m => m.has(id)))
     const result = new Map<string, string>()
     for (const id of intersectedIds) result.set(id, first.get(id)!)
-    this.logger.info(`AND logic: intersection count = ${result.size}`)
+    this.logger.debug(`AND logic: intersection count = ${result.size}`)
     return result
   }
 
@@ -381,35 +418,29 @@ export class SmartAlbumManager {
     album: AlbumSettings,
     candidates: Map<string, string>,
     existingChecksums: Set<string>
-  ): Promise<number> {
+  ): Promise<{ added: number; skipped: number }> {
 
     const toAdd: string[] = []
-    let skippedDuplicates = 0
+    let skipped = 0
 
     for (const [id, checksum] of candidates) {
       if (existingChecksums.has(checksum)) {
-        skippedDuplicates++
+        skipped++
       } else {
         toAdd.push(id)
         existingChecksums.add(checksum)
       }
     }
 
-    if (skippedDuplicates > 0) {
-      this.logger.info(`Skipped ${skippedDuplicates} cross-user duplicate(s) already in album '${album.name}'`)
-    }
-
-    this.logger.info(`Found ${toAdd.length} new assets to add to album '${album.name}'`)
+    this.logger.debug(`${toAdd.length} new asset(s) to add, ${skipped} cross-user duplicate(s) skipped`)
     this.logger.debug('Asset IDs to add:', toAdd)
 
     if (toAdd.length === 0) {
-      this.logger.info('No new assets to add.')
-      return 0
+      return { added: 0, skipped }
     }
 
     await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: toAdd } })
-    this.logger.info(`Added ${toAdd.length} assets to album '${album.name}'`)
-    return toAdd.length
+    return { added: toAdd.length, skipped }
   }
 
   /**
@@ -447,49 +478,12 @@ export class SmartAlbumManager {
       if (toRemove.length === 0) return 0
 
       await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: toRemove } })
-      this.logger.info(`Removed ${toRemove.length} excluded assets from album '${album.name}'`)
+      this.logger.debug(`Removed ${toRemove.length} excluded asset(s) from album '${album.name}'`)
       return toRemove.length
     } catch (err) {
       this.logger.error('Error removing excluded assets from album:', err)
       throw err
     }
-  }
-
-  /**
-   * Logs a header block at the start of album processing.
-   * In `info` mode, key fields are logged individually.
-   * In `debug` mode, the full album object is logged.
-   *
-   * @param album - The album being processed.
-   */
-  private logAlbumHeader(album: AlbumSettings) {
-    this.logger.info(`Processing album: ${album.name}`)
-    if (this.logLevel === 'debug') {
-      this.logger.debug('Album details:', album)
-    } else {
-      this.logger.info(`Logic: ${album.logic}`)
-      this.logger.info(`faceNames: ${album.faceNames?.join(', ') || ''}`)
-      this.logger.info(`excludeFaceNames: ${album.excludeFaceNames?.join(', ') || ''}`)
-    }
-  }
-
-  /**
-   * Logs a structured summary after an album has been processed.
-   *
-   * @param album        - The album that was processed.
-   * @param addedCount   - Number of assets added.
-   * @param removedCount - Number of assets removed.
-   */
-  private logSummary(album: AlbumSettings, addedCount: number, removedCount: number) {
-    this.logger.info('--- Album Processing Summary ---')
-    this.logger.info(`Album: ${album.name}`)
-    this.logger.info(`Logic: ${album.logic}`)
-    this.logger.info(`faceNames: ${album.faceNames?.join(', ') || ''}`)
-    this.logger.info(`excludeFaceNames: ${album.excludeFaceNames?.join(', ') || ''}`)
-    this.logger.info(`Assets added: ${addedCount}`)
-    this.logger.info(`Assets removed: ${removedCount}`)
-    this.logger.info('------------------------------')
-    this.logger.debug('Summary:', { album: album.name, albumId: album.albumId, addedCount, removedCount })
   }
 
   private loadSyncState(): Record<string, Record<string, Record<string, string>>> {
@@ -498,11 +492,10 @@ export class SmartAlbumManager {
         const content = fs.readFileSync(this.syncFilePath, 'utf-8').trim()
         const parsed = JSON.parse(content)
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          const userCount = Object.keys(parsed).length
-          this.logger.info(`Loaded sync state with ${userCount} user(s)`)
+          this.logger.debug(`Loaded sync state for ${Object.keys(parsed).length} user(s)`)
           return parsed
         }
-        this.logger.info('Invalid sync state file, starting fresh')
+        this.logger.warn('Sync state file is invalid — starting fresh (full re-sync)')
       }
     } catch (err) {
       this.logger.error('Error reading sync state:', err)
@@ -513,8 +506,7 @@ export class SmartAlbumManager {
   private saveSyncState(): void {
     try {
       fs.writeFileSync(this.syncFilePath, JSON.stringify(this.syncState, null, 2), 'utf-8')
-      const userCount = Object.keys(this.syncState).length
-      this.logger.info(`Saved sync state with ${userCount} user(s)`)
+      this.logger.debug(`Sync state saved`)
     } catch (err) {
       this.logger.error('Error saving sync state:', err)
     }

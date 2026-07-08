@@ -31,11 +31,17 @@ export function loadConfig(): SmartAlbumConfig {
     seen.add(name)
   }
 
-  const allAlbumIds = config.users.flatMap(u => u.albums.map(a => a.albumId))
-  const seenIds = new Set<string>()
-  for (const id of allAlbumIds) {
-    if (seenIds.has(id)) throw new Error(`Duplicate albumId in config: "${id}". Each album entry must reference a distinct Immich album.`)
-    seenIds.add(id)
+  // albumId uniqueness is checked per-user only. The same albumId CAN appear under
+  // different users — this is the intended shared-album scenario where each user
+  // contributes their own photos to a common album.
+  for (const user of config.users) {
+    const seenIds = new Set<string>()
+    for (const album of user.albums) {
+      if (seenIds.has(album.albumId)) {
+        throw new Error(`Duplicate albumId "${album.albumId}" within the same user's albums. Each user's album list must reference distinct Immich albums.`)
+      }
+      seenIds.add(album.albumId)
+    }
   }
 
   return config

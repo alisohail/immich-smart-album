@@ -25,6 +25,14 @@ export function createLogger(logLevel: 'debug' | 'info' = 'info') {
     },
 
     /**
+     * Logs a warning message to stderr.
+     * @param args - Values to log, forwarded to `console.warn`.
+     */
+    warn: (...args: any[]) => {
+      console.warn('[WARN]', ...args)
+    },
+
+    /**
      * Logs a debug message to stdout. No-op when `logLevel` is `'info'`.
      * @param args - Values to log, forwarded to `console.debug`.
      */
