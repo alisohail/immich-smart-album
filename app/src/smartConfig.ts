@@ -16,10 +16,33 @@ import { SmartAlbumConfig } from './types'
 export function loadConfig(): SmartAlbumConfig {
   const configDir = process.env.CONFIG_DIR || '/config'
   const configPath = process.env.SMART_ALBUM_CONFIG || path.join(configDir, 'config.json')
+  let config: SmartAlbumConfig
   try {
     const raw = fs.readFileSync(configPath, 'utf-8')
-    return JSON.parse(raw)
+    config = JSON.parse(raw)
   } catch (err) {
     throw new Error('Failed to load config: ' + err)
   }
+
+  const allNames = config.users.flatMap(u => u.albums.map(a => a.name))
+  const seen = new Set<string>()
+  for (const name of allNames) {
+    if (seen.has(name)) throw new Error(`Duplicate album name in config: "${name}". Album names must be unique across all users as they are used as sync state keys.`)
+    seen.add(name)
+  }
+
+  // albumId uniqueness is checked per-user only. The same albumId CAN appear under
+  // different users — this is the intended shared-album scenario where each user
+  // contributes their own photos to a common album.
+  for (const user of config.users) {
+    const seenIds = new Set<string>()
+    for (const album of user.albums) {
+      if (seenIds.has(album.albumId)) {
+        throw new Error(`Duplicate albumId "${album.albumId}" within the same user's albums. Each user's album list must reference distinct Immich albums.`)
+      }
+      seenIds.add(album.albumId)
+    }
+  }
+
+  return config
 }

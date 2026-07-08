@@ -45,6 +45,24 @@ services:
 - `options`: (object)
   - `logLevel`: ("info" or "debug") Controls the verbosity of log output.
 
+### Config Validation Rules
+
+- **`name` must be unique** across all users and albums. It is used as the sync state key — two entries sharing the same name would overwrite each other's incremental sync dates.
+- **`albumId` must be unique** across all users and albums. Pointing two entries at the same Immich album would cause it to be processed twice per run and produce incorrect sync state.
+
+Both rules are validated on startup. The container will exit with a clear error message if either is violated.
+
+### Incremental Sync
+
+A `.sync-state.json` file is written to the `/config` directory after each successful sync. It tracks the last successful sync date per album per face name, enabling incremental syncs:
+
+- **First run:** all face photos are fetched and added.
+- **Subsequent runs:** only photos updated since the last sync are fetched, keeping API calls minimal.
+- **New face added to an existing album:** the new face triggers a full re-scan of all faces in that album (required for AND logic correctness) or only that face (OR logic).
+- **Sync state is only updated after a fully successful album sync.** If any step fails, the album will be fully re-evaluated on the next run.
+
+> Do not edit `.sync-state.json` manually unless you want to force a full re-sync. To reset a specific album, delete its entry from the file or delete the file entirely.
+
 ### Example config/config.json
 ```json
 {
