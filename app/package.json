@@ -1,6 +1,6 @@
 {
   "name": "immich-smart-album",
-  "version": "0.4.0",
+  "version": "1.0.0-alpha",
   "description": "Create smart albums in Immich based on face IDs with flexible logic.",
   "main": "dist/main.js",
   "scripts": {
