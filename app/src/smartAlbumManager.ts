@@ -1,11 +1,12 @@
 import { ImmichClient, AlbumSettings, SmartAlbumConfig } from './types'
 import { createLogger } from './utils'
-import { AssetResponseDto, init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getMyUser } from '@immich/sdk'
+import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getMyUser } from '@immich/sdk'
 import fs from 'fs'
 import path from 'path'
 import dayjs from 'dayjs'
 
 const PAGE_SIZE = 100
+const BATCH_SIZE = 500  // max IDs per addAssetsToAlbum / removeAssetFromAlbum call
 const SYNC_STATE_FILENAME = '.sync-state.json'
 
 export class SmartAlbumManager {
@@ -291,9 +292,16 @@ export class SmartAlbumManager {
   ): Promise<Set<string>> {
     if (excludeFaceIds.length === 0) return new Set()
 
-    const label = excludeFaceIds.map(getFaceName).join(', ')
-    const assetMap = await this.fetchAllAssetIdsForPersons(excludeFaceIds, `exclude: ${label}`)
-    return new Set(assetMap.keys())
+    // Query each excluded face individually and union the results.
+    // Passing multiple personIds in one call uses AND semantics in Immich,
+    // which would only exclude photos containing ALL excluded people together.
+    const combined = new Set<string>()
+    for (const faceId of excludeFaceIds) {
+      const label = getFaceName(faceId)
+      const assetMap = await this.fetchAllAssetIdsForPersons([faceId], `exclude: ${label}`)
+      for (const id of assetMap.keys()) combined.add(id)
+    }
+    return combined
   }
 
   /**
@@ -345,19 +353,13 @@ export class SmartAlbumManager {
   ): Promise<Map<string, string>> {
     const combined = new Map<string, string>()
 
-    // Group faces by their sync date so faces with the same date can be
-    // fetched in a single API call instead of N separate calls.
-    const groups = new Map<string | null, string[]>()
+    // Each face must be queried individually. Immich's searchAssets treats
+    // multiple personIds as AND (all persons must appear in the photo), not OR.
+    // We union the per-face results ourselves to achieve OR semantics.
     for (const faceId of faceIds) {
-      const syncDate = this.syncState[userId]?.[album.name]?.[getFaceName(faceId)] || null
-      const group = groups.get(syncDate) ?? []
-      group.push(faceId)
-      groups.set(syncDate, group)
-    }
-
-    for (const [syncDate, groupFaceIds] of groups) {
-      const label = groupFaceIds.map(getFaceName).join(', ')
-      const assets = await this.fetchAllAssetIdsForPersons(groupFaceIds, label, excludedAssetIds, syncDate)
+      const label = getFaceName(faceId)
+      const syncDate = this.syncState[userId]?.[album.name]?.[label] || null
+      const assets = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
       for (const [id, checksum] of assets) combined.set(id, checksum)
     }
 
@@ -439,7 +441,10 @@ export class SmartAlbumManager {
       return { added: 0, skipped }
     }
 
-    await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: toAdd } })
+    // Batch to avoid oversized request payloads on large first-run syncs.
+    for (let i = 0; i < toAdd.length; i += BATCH_SIZE) {
+      await addAssetsToAlbum({ id: album.albumId, bulkIdsDto: { ids: toAdd.slice(i, i + BATCH_SIZE) } })
+    }
     return { added: toAdd.length, skipped }
   }
 
@@ -460,26 +465,33 @@ export class SmartAlbumManager {
     if (excludeFaceIds.length === 0) return 0
 
     try {
-      // Query the intersection of (album assets) ∩ (excluded-face assets) directly.
-      // This avoids loading all album assets just to filter them locally.
-      const toRemove: string[] = []
-      let nextPage: any = 1
+      // Query each excluded face individually and union results.
+      // A single call with multiple personIds uses AND semantics in Immich,
+      // which would only find photos where ALL excluded people appear together.
+      const toRemove = new Set<string>()
 
-      do {
-        const result = await searchAssets({
-          metadataSearchDto: { albumIds: [album.albumId], personIds: excludeFaceIds, page: Number(nextPage), size: PAGE_SIZE }
-        })
-        const items = result.assets?.items || []
-        toRemove.push(...items.map((a: AssetResponseDto) => a.id))
-        this.logger.debug(`Fetched ${items.length} excluded assets in album (page ${nextPage})`)
-        nextPage = result.assets?.nextPage ?? null
-      } while (nextPage !== null)
+      for (const faceId of excludeFaceIds) {
+        let nextPage: any = 1
+        do {
+          const result = await searchAssets({
+            metadataSearchDto: { albumIds: [album.albumId], personIds: [faceId], page: Number(nextPage), size: PAGE_SIZE }
+          })
+          const items = result.assets?.items || []
+          for (const a of items) toRemove.add(a.id)
+          this.logger.debug(`Fetched ${items.length} excluded assets in album for [${faceId}] (page ${nextPage})`)
+          nextPage = result.assets?.nextPage ?? null
+        } while (nextPage !== null)
+      }
 
-      if (toRemove.length === 0) return 0
+      if (toRemove.size === 0) return 0
 
-      await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: toRemove } })
-      this.logger.debug(`Removed ${toRemove.length} excluded asset(s) from album '${album.name}'`)
-      return toRemove.length
+      const ids = [...toRemove]
+      // Batch to avoid oversized request payloads.
+      for (let i = 0; i < ids.length; i += BATCH_SIZE) {
+        await removeAssetFromAlbum({ id: album.albumId, bulkIdsDto: { ids: ids.slice(i, i + BATCH_SIZE) } })
+      }
+      this.logger.debug(`Removed ${toRemove.size} excluded asset(s) from album '${album.name}'`)
+      return toRemove.size
     } catch (err) {
       this.logger.error('Error removing excluded assets from album:', err)
       throw err
