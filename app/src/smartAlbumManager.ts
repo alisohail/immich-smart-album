@@ -79,8 +79,12 @@ export class SmartAlbumManager {
         for (const album of user.albums) {
           await this.processAlbum(userId, userName, album)
         }
-      } catch (err) {
-        this.logger.error('User processing failed:', err)
+      } catch (err: any) {
+        if (err?.data) {
+          this.logger.error('User processing failed:', err.message || err, '\nAPI Response:', JSON.stringify(err.data, null, 2))
+        } else {
+          this.logger.error('User processing failed:', err)
+        }
       }
     }
 
@@ -185,8 +189,17 @@ export class SmartAlbumManager {
       if (removedCount > 0) resultParts.push(`-${removedCount} removed`)
       if (skipped > 0) resultParts.push(`${skipped} duplicate(s) skipped`)
       this.logger.info(`    → ${resultParts.length > 0 ? resultParts.join(', ') : 'nothing to sync'}`)
-    } catch (err) {
-      this.logger.error(`    → Failed processing "${album.name}":`, err)
+    } catch (err: any) {
+      if (err?.data) {
+        this.logger.error(
+          `    → Failed processing "${album.name}":`,
+          err.message || err,
+          '\n    API Response:',
+          JSON.stringify(err.data, null, 2)
+        )
+      } else {
+        this.logger.error(`    → Failed processing "${album.name}":`, err)
+      }
     }
   }
 
