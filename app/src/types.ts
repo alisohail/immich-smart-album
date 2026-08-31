@@ -44,13 +44,32 @@ export interface AlbumSettings {
   /** Immich album ID to add assets to (must already exist in Immich). */
   albumId: string
   /** Person names whose assets should be included in the album. */
-  faceNames: string[]
+  faceNames?: string[]
   /** Person names whose assets should be excluded from the album, even if they match `faceNames`. */
   excludeFaceNames?: string[]
+  /** Minimum number of strictly named persons required in a photo. */
+  minNamedFaces?: number
   /**
    * Determines how multiple `faceNames` are combined:
-   * - `'OR'`  – include assets containing **any** of the listed persons.
-   * - `'AND'` – include only assets containing **all** of the listed persons.
+   * Required if `faceNames` contains 2 or more names.
    */
-  logic: 'AND' | 'OR'
+  logic?: 'AND' | 'OR'
 }
+
+export interface AlbumSyncState {
+  /** Last successful sync timestamp for count-only albums. */
+  lastAlbumSync?: string
+  /** Recorded threshold; used to detect configuration changes. */
+  minNamedFaces?: number
+  /** Per-face sync timestamps for person-based searches. */
+  faces: Record<string, string>
+}
+
+export type UserSyncState = Record<string, AlbumSyncState>
+export type SmartAlbumSyncState = Record<string, UserSyncState>
+
+export interface FetchedAssetInfo {
+  checksum: string
+  people?: Array<{ id: string; name?: string | null }>
+}
+

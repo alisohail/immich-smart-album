@@ -1,7 +1,14 @@
 # Immich Smart Album (Developer Guide)
 
 ## Overview
-This project creates smart albums in Immich based on face names (person names), with support for AND/OR logic, robust logging, and error handling. You can also exclude people from albums using excludeFaceNames. It is written in TypeScript and runs as a Docker container.
+This project creates smart albums in Immich based on face names (person names) and/or minimum named face thresholds (`minNamedFaces`), with support for AND/OR logic, robust logging, and error handling. You can also exclude people from albums using `excludeFaceNames`. It is written in TypeScript and runs as a Docker container.
+
+### Features
+- **Face matching**: Match specific recognized persons using `faceNames` with `logic: "AND"` or `logic: "OR"`.
+- **Minimum named faces filter (`minNamedFaces`)**: Filter photos to require at least $N$ recognized/named individuals in the photo. Works as a standalone group photo filter (count-only across library) or combined with `faceNames` (hybrid mode).
+- **Face exclusions**: Exclude photos containing any person specified in `excludeFaceNames`.
+- **Incremental sync**: Fast recurring syncs using `.sync-state.json` to only inspect newly uploaded or modified assets.
+
 
 ## Prerequisites
 - Node.js and npm

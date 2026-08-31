@@ -41,6 +41,31 @@ export function loadConfig(): SmartAlbumConfig {
         throw new Error(`Duplicate albumId "${album.albumId}" within the same user's albums. Each user's album list must reference distinct Immich albums.`)
       }
       seenIds.add(album.albumId)
+
+      const hasFaceNames = (album.faceNames?.length ?? 0) > 0
+      const hasMinNamedFaces = album.minNamedFaces !== undefined
+
+      if (!hasFaceNames && !hasMinNamedFaces) {
+        throw new Error(`Album '${album.name}' must define either non-empty 'faceNames' or 'minNamedFaces'.`)
+      }
+
+      if (album.minNamedFaces !== undefined) {
+        if (
+          typeof album.minNamedFaces !== 'number' ||
+          !Number.isInteger(album.minNamedFaces) ||
+          album.minNamedFaces < 1
+        ) {
+          throw new Error(`Album '${album.name}': 'minNamedFaces' must be an integer greater than or equal to 1.`)
+        }
+      }
+
+      if (album.logic !== undefined && album.logic !== 'AND' && album.logic !== 'OR') {
+        throw new Error(`Album '${album.name}': 'logic' must be 'AND' or 'OR'.`)
+      }
+
+      if ((album.faceNames?.length ?? 0) >= 2 && !album.logic) {
+        throw new Error(`Album '${album.name}' has multiple faceNames and must specify 'logic' as either 'AND' or 'OR'.`)
+      }
     }
   }
 

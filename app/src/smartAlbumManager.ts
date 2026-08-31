@@ -1,4 +1,4 @@
-import { ImmichClient, AlbumSettings, SmartAlbumConfig } from './types'
+import { ImmichClient, AlbumSettings, SmartAlbumConfig, SmartAlbumSyncState, AlbumSyncState, FetchedAssetInfo } from './types'
 import { createLogger } from './utils'
 import { init, addAssetsToAlbum, searchAssets, searchPerson, removeAssetFromAlbum, getMyUser } from '@immich/sdk'
 import fs from 'fs'
@@ -13,7 +13,7 @@ export class SmartAlbumManager {
   private config: SmartAlbumConfig
   private logger: ReturnType<typeof createLogger>
   private logLevel: 'debug' | 'info'
-  private syncState: Record<string, Record<string, Record<string, string>>> = {}
+  private syncState: SmartAlbumSyncState = {}
   private syncFilePath: string
   private runAlbumChecksums = new Map<string, Set<string>>()
   private running = false
@@ -32,6 +32,24 @@ export class SmartAlbumManager {
 
   get log() {
     return this.logger
+  }
+
+  /**
+   * Counts how many distinct recognized people are in the photo.
+   * Deduplicated strictly by person ID (`p.id`), ignoring empty names.
+   * Faces are not disqualified by `isHidden`.
+   */
+  private countNamedFaces(asset: {
+    people?: Array<{ id: string; name?: string | null }>
+  }): number {
+    const uniquePersons = new Set<string>()
+    for (const p of asset.people || []) {
+      const name = p.name?.trim()
+      if (name && name.length > 0) {
+        uniquePersons.add(p.id)
+      }
+    }
+    return uniquePersons.size
   }
 
   /**
@@ -82,17 +100,35 @@ export class SmartAlbumManager {
     const { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId } = await this.resolveAllFaceIds(album)
     const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
-    // Single compact header line: "Family" [OR] | faces: Alice, Bob | exclude: Eve
-    const facesDisplay = (album.faceNames || []).join(', ') || '(none)'
-    const excludeDisplay = (album.excludeFaceNames || []).length > 0
-      ? `  |  exclude: ${(album.excludeFaceNames || []).join(', ')}`
-      : ''
-    this.logger.info(`  "${album.name}"  [${album.logic}]  |  faces: ${facesDisplay}${excludeDisplay}`)
+    // Conditionally render components without visual glitches:
+    const parts: string[] = [`"${album.name}"`]
+    if (album.logic) parts.push(`[${album.logic}]`)
+    if ((album.faceNames || []).length > 0) {
+      parts.push(`faces: ${(album.faceNames || []).join(', ')}`)
+    }
+    if (album.minNamedFaces !== undefined) {
+      parts.push(`minNamedFaces: ${album.minNamedFaces}`)
+    }
+    if ((album.excludeFaceNames || []).length > 0) {
+      parts.push(`exclude: ${(album.excludeFaceNames || []).join(', ')}`)
+    }
+    this.logger.info(`  ${parts.join('  |  ')}`)
 
     // Warn if face names were configured but none could be resolved in Immich.
     if (faceIds.length === 0 && (album.faceNames || []).length > 0) {
       this.logger.warn(`    No faces resolved — check face names match Immich exactly`)
       return
+    }
+
+    // Threshold Modification Detection & Historical Resync:
+    const albumState = this.syncState[userId]?.[album.name]
+    if (albumState && album.minNamedFaces !== albumState.minNamedFaces) {
+      this.logger.info(
+        `  'minNamedFaces' changed (previous: ` +
+        `${albumState.minNamedFaces ?? 'none'}, current: ` +
+        `${album.minNamedFaces ?? 'none'}); resetting sync state.`
+      )
+      delete this.syncState[userId][album.name]
     }
 
     // Capture start time per-album so that photos uploaded during a long multi-album
@@ -101,8 +137,16 @@ export class SmartAlbumManager {
     const syncStartTime = dayjs().toISOString()
 
     try {
-      const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
-      const candidateAssets = await this.collectTargetAssetIds(userId, album, faceIds, excludedAssetIds, getFaceName)
+      let candidateAssets: Map<string, string>
+
+      if ((album.faceNames || []).length === 0) {
+        // Count-only pipeline: Call fetchAllAssetsForMinFaces directly without fetchExcludedAssetIds
+        candidateAssets = await this.fetchAllAssetsForMinFaces(userId, album, excludeFaceIds)
+      } else {
+        // Person-filtered / hybrid pipeline
+        const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
+        candidateAssets = await this.collectTargetAssetIds(userId, album, faceIds, excludedAssetIds, getFaceName)
+      }
 
       // Only fetch existing checksums when we have candidates AND multiple users are configured.
       // We query only the face-matched assets already in the album (albumIds + personIds), not all album assets.
@@ -115,23 +159,32 @@ export class SmartAlbumManager {
       const { added, skipped } = await this.addAssets(album, candidateAssets, existingChecksums)
       const removedCount = await this.removeExcludedAssets(album, excludeFaceIds)
 
-      // Update sync state for each face in this album after successful processing.
+      // Update sync state for this album after successful processing.
       // Keyed by stable userId (UUID) — not display name, which can change in Immich.
-      for (const faceId of faceIds) {
-        if (!this.syncState[userId]) this.syncState[userId] = {}
-        if (!this.syncState[userId][album.name]) this.syncState[userId][album.name] = {}
-        this.syncState[userId][album.name][getFaceName(faceId)] = syncStartTime
+      if (!this.syncState[userId]) this.syncState[userId] = {}
+      let currentAlbumState = this.syncState[userId][album.name]
+      if (!currentAlbumState) {
+        currentAlbumState = this.syncState[userId][album.name] = { faces: {} }
+      }
+      currentAlbumState.minNamedFaces = album.minNamedFaces
+
+      if ((album.faceNames || []).length === 0) {
+        currentAlbumState.lastAlbumSync = syncStartTime
+      } else {
+        for (const faceId of faceIds) {
+          currentAlbumState.faces[getFaceName(faceId)] = syncStartTime
+        }
       }
 
       // Save after each successful album so progress is not lost if the process crashes.
       this.saveSyncState()
 
       // Single compact result line
-      const parts: string[] = []
-      if (added > 0) parts.push(`+${added} added`)
-      if (removedCount > 0) parts.push(`-${removedCount} removed`)
-      if (skipped > 0) parts.push(`${skipped} duplicate(s) skipped`)
-      this.logger.info(`    → ${parts.length > 0 ? parts.join(', ') : 'nothing to sync'}`)
+      const resultParts: string[] = []
+      if (added > 0) resultParts.push(`+${added} added`)
+      if (removedCount > 0) resultParts.push(`-${removedCount} removed`)
+      if (skipped > 0) resultParts.push(`${skipped} duplicate(s) skipped`)
+      this.logger.info(`    → ${resultParts.length > 0 ? resultParts.join(', ') : 'nothing to sync'}`)
     } catch (err) {
       this.logger.error(`    → Failed processing "${album.name}":`, err)
     }
@@ -241,15 +294,18 @@ export class SmartAlbumManager {
    * @param personIds  - Immich person IDs to search for.
    * @param label      - Human-readable label used in log messages.
    * @param excludeSet - Optional set of asset IDs to exclude from the result.
-   * @returns A `Set` of matching asset IDs.
+   * @param updatedAfter - Optional timestamp to filter assets updated after.
+   * @param withPeople - Whether to request person metadata on assets.
+   * @returns A Map of matching asset ID to FetchedAssetInfo.
    */
   private async fetchAllAssetIdsForPersons(
     personIds: string[],
     label: string,
     excludeSet: Set<string> = new Set(),
-    updatedAfter?: string | null
-  ): Promise<Map<string, string>> {
-    const assetMap = new Map<string, string>() // Map<assetId, checksum>
+    updatedAfter?: string | null,
+    withPeople: boolean = false
+  ): Promise<Map<string, FetchedAssetInfo>> {
+    const assetMap = new Map<string, FetchedAssetInfo>()
     let nextPage: any = 1
 
     if (updatedAfter) {
@@ -264,11 +320,16 @@ export class SmartAlbumManager {
       if (updatedAfter) {
         dto.updatedAfter = updatedAfter
       }
+      if (withPeople) {
+        dto.withPeople = true
+      }
       const result = await searchAssets({ metadataSearchDto: dto })
       const items = result.assets?.items || []
 
       for (const asset of items) {
-        if (!excludeSet.has(asset.id)) assetMap.set(asset.id, asset.checksum)
+        if (!excludeSet.has(asset.id)) {
+          assetMap.set(asset.id, { checksum: asset.checksum, people: asset.people })
+        }
       }
 
       this.logger.debug(`Fetched ${items.length} assets for [${label}] (page ${nextPage})`)
@@ -331,6 +392,8 @@ export class SmartAlbumManager {
     if (album.logic === 'OR') {
       return this.collectOrAssets(userId, album, faceIds, excludedAssetIds, getFaceName)
     } else {
+      // Handles explicit 'AND' as well as single-face albums where 'logic' is omitted.
+      // For a single face, set intersection reduces trivially to the single set itself.
       return this.collectAndAssets(userId, album, faceIds, excludedAssetIds, getFaceName)
     }
   }
@@ -358,9 +421,20 @@ export class SmartAlbumManager {
     // We union the per-face results ourselves to achieve OR semantics.
     for (const faceId of faceIds) {
       const label = getFaceName(faceId)
-      const syncDate = this.syncState[userId]?.[album.name]?.[label] || null
-      const assets = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
-      for (const [id, checksum] of assets) combined.set(id, checksum)
+      const syncDate = this.syncState[userId]?.[album.name]?.faces?.[label] || null
+      const assets = await this.fetchAllAssetIdsForPersons(
+        [faceId],
+        label,
+        excludedAssetIds,
+        syncDate,
+        album.minNamedFaces !== undefined
+      )
+      for (const [id, info] of assets) {
+        if (album.minNamedFaces !== undefined && this.countNamedFaces(info) < album.minNamedFaces) {
+          continue
+        }
+        combined.set(id, info.checksum)
+      }
     }
 
     this.logger.debug(`OR logic: union count = ${combined.size}`)
@@ -386,26 +460,90 @@ export class SmartAlbumManager {
     // For AND logic, if any face is new (no sync date), we must do a full
     // sync for ALL faces — an incremental fetch on old faces would miss
     // historical assets that now match the full intersection.
-    const anyNew = faceIds.some(id => !this.syncState[userId]?.[album.name]?.[getFaceName(id)])
+    const anyNew = faceIds.some(
+      id => !this.syncState[userId]?.[album.name]?.faces?.[getFaceName(id)]
+    )
     if (anyNew) {
       this.logger.debug('AND logic: new face detected, performing full sync for all faces in this album')
     }
 
-    const perFaceMaps: Map<string, string>[] = []
+    const perFaceMaps: Map<string, FetchedAssetInfo>[] = []
 
     for (const faceId of faceIds) {
       const label = getFaceName(faceId)
-      const syncDate = anyNew ? null : (this.syncState[userId]?.[album.name]?.[label] || null)
-      const assetMap = await this.fetchAllAssetIdsForPersons([faceId], label, excludedAssetIds, syncDate)
+      const syncDate = anyNew
+        ? null
+        : (this.syncState[userId]?.[album.name]?.faces?.[label] || null)
+      const assetMap = await this.fetchAllAssetIdsForPersons(
+        [faceId],
+        label,
+        excludedAssetIds,
+        syncDate,
+        album.minNamedFaces !== undefined
+      )
       perFaceMaps.push(assetMap)
     }
 
     const [first, ...rest] = perFaceMaps
     const intersectedIds = [...first.keys()].filter(id => rest.every(m => m.has(id)))
     const result = new Map<string, string>()
-    for (const id of intersectedIds) result.set(id, first.get(id)!)
+    for (const id of intersectedIds) {
+      const info = first.get(id)!
+      if (album.minNamedFaces !== undefined && this.countNamedFaces(info) < album.minNamedFaces) {
+        continue
+      }
+      result.set(id, info.checksum)
+    }
     this.logger.debug(`AND logic: intersection count = ${result.size}`)
     return result
+  }
+
+  /**
+   * Fetches assets for count-only albums across all pages, filtering by minNamedFaces
+   * and evaluating exclusions directly in-memory against asset.people.
+   */
+  private async fetchAllAssetsForMinFaces(
+    userId: string,
+    album: AlbumSettings,
+    excludeFaceIds: string[]
+  ): Promise<Map<string, string>> {
+    const syncDate = this.syncState[userId]?.[album.name]?.lastAlbumSync
+    const candidates = new Map<string, string>()
+    let nextPage: any = 1
+
+    do {
+      this.logger.debug(`Fetching page ${nextPage} for count-only album [${album.name}]`)
+      const dto: any = {
+        page: Number(nextPage),
+        size: PAGE_SIZE,
+        withPeople: true,
+      }
+      if (syncDate) {
+        dto.updatedAfter = syncDate
+      }
+      const result = await searchAssets({ metadataSearchDto: dto })
+      const items = result.assets?.items || []
+
+      for (const asset of items) {
+        // In-Memory Exclusion Check:
+        const isExcluded = (asset.people || []).some(
+          p =>
+            excludeFaceIds.includes(p.id) ||
+            (p.name && album.excludeFaceNames?.includes(p.name))
+        )
+        if (isExcluded) continue
+
+        // Threshold Evaluation:
+        if (this.countNamedFaces(asset) >= (album.minNamedFaces ?? 1)) {
+          candidates.set(asset.id, asset.checksum)
+        }
+      }
+
+      this.logger.debug(`Fetched ${items.length} assets for count-only album [${album.name}] (page ${nextPage})`)
+      nextPage = result.assets?.nextPage ?? null
+    } while (nextPage !== null)
+
+    return candidates
   }
 
   /**
@@ -498,14 +636,32 @@ export class SmartAlbumManager {
     }
   }
 
-  private loadSyncState(): Record<string, Record<string, Record<string, string>>> {
+  private loadSyncState(): SmartAlbumSyncState {
     try {
       if (fs.existsSync(this.syncFilePath)) {
         const content = fs.readFileSync(this.syncFilePath, 'utf-8').trim()
         const parsed = JSON.parse(content)
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          this.logger.debug(`Loaded sync state for ${Object.keys(parsed).length} user(s)`)
-          return parsed
+          const migrated: SmartAlbumSyncState = {}
+          for (const [userId, userState] of Object.entries(parsed)) {
+            migrated[userId] = {}
+            if (userState && typeof userState === 'object' && !Array.isArray(userState)) {
+              for (const [albumName, albumState] of Object.entries(userState as Record<string, any>)) {
+                if (albumState && typeof albumState === 'object' && !Array.isArray(albumState)) {
+                  if (albumState.faces && typeof albumState.faces === 'object') {
+                    migrated[userId][albumName] = albumState as AlbumSyncState
+                  } else {
+                    // Migrate legacy flat { [faceName]: timestamp } dictionary
+                    migrated[userId][albumName] = {
+                      faces: { ...albumState }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          this.logger.debug(`Loaded sync state for ${Object.keys(migrated).length} user(s)`)
+          return migrated
         }
         this.logger.warn('Sync state file is invalid — starting fresh (full re-sync)')
       }
@@ -524,3 +680,4 @@ export class SmartAlbumManager {
     }
   }
 }
+
