@@ -7,10 +7,21 @@
       "albums": [
         {
           "name": "Family Album",
-          "albumId": "your-album-id",
+          "albumId": "your-album-id-1",
           "faceNames": ["Alice", "Bob"],
           "excludeFaceNames": ["Eve", "Mallory"],
           "logic": "OR"
+        },
+        {
+          "name": "Group Photos",
+          "albumId": "your-album-id-2",
+          "minNamedFaces": 3
+        },
+        {
+          "name": "Alice with Friends",
+          "albumId": "your-album-id-3",
+          "faceNames": ["Alice"],
+          "minNamedFaces": 2
         }
       ]
     }
