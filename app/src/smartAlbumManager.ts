@@ -42,14 +42,14 @@ export class SmartAlbumManager {
   private countNamedFaces(asset: {
     people?: Array<{ id: string; name?: string | null }>
   }): number {
-    const uniquePersons = new Set<string>()
+    const uniquePersons = new Set<string>();
     for (const p of asset.people || []) {
-      const name = p.name?.trim()
+      const name = p.name?.trim();
       if (name && name.length > 0) {
-        uniquePersons.add(p.id)
+        uniquePersons.add(p.id);
       }
     }
-    return uniquePersons.size
+    return uniquePersons.size;
   }
 
   /**
@@ -80,7 +80,7 @@ export class SmartAlbumManager {
           await this.processAlbum(userId, userName, album)
         }
       } catch (err) {
-          this.logger.error('User processing failed:', err)
+        this.logger.error('User processing failed:', err)
       }
     }
 
@@ -101,20 +101,20 @@ export class SmartAlbumManager {
     const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
     // Conditionally render components:
-    const parts: string[] = [`"${album.name}"`]
+    const parts: string[] = [`"${album.name}"`];
     if (album.logic) {
       parts.push(`[${album.logic}]`);
     }
     if ((album.faceNames || []).length > 0) {
-      parts.push(`faces: ${(album.faceNames || []).join(', ')}`)
+      parts.push(`faces: ${(album.faceNames || []).join(', ')}`);
     }
     if (album.minNamedFaces !== undefined) {
-      parts.push(`minNamedFaces: ${album.minNamedFaces}`)
+      parts.push(`minNamedFaces: ${album.minNamedFaces}`);
     }
     if ((album.excludeFaceNames || []).length > 0) {
-      parts.push(`exclude: ${(album.excludeFaceNames || []).join(', ')}`)
+      parts.push(`exclude: ${(album.excludeFaceNames || []).join(', ')}`);
     }
-    this.logger.info(`  ${parts.join('  |  ')}`)
+    this.logger.info(`  ${parts.join('  |  ')}`);
 
     // Warn if face names were configured but none could be resolved in Immich.
     if (faceIds.length === 0 && (album.faceNames || []).length > 0) {
@@ -123,14 +123,14 @@ export class SmartAlbumManager {
     }
 
     // Threshold Modification Detection & Historical Resync:
-    const albumState = this.syncState[userId]?.[album.name]
+    const albumState = this.syncState[userId]?.[album.name];
     if (albumState && album.minNamedFaces !== albumState.minNamedFaces) {
       this.logger.info(
         `  'minNamedFaces' changed (previous: ` +
         `${albumState.minNamedFaces ?? 'none'}, current: ` +
         `${album.minNamedFaces ?? 'none'}); resetting sync state.`
-      )
-      delete this.syncState[userId][album.name]
+      );
+      delete this.syncState[userId][album.name];
     }
 
     // Capture start time per-album so that photos uploaded during a long multi-album
@@ -139,15 +139,15 @@ export class SmartAlbumManager {
     const syncStartTime = dayjs().toISOString()
 
     try {
-      let candidateAssets: Map<string, string>
+      let candidateAssets: Map<string, string>;
 
       if ((album.faceNames || []).length === 0) {
         // Count-only pipeline: Call fetchAllAssetsForMinFaces directly without fetchExcludedAssetIds
-        candidateAssets = await this.fetchAllAssetsForMinFaces(userId, album, excludeFaceIds)
+        candidateAssets = await this.fetchAllAssetsForMinFaces(userId, album, excludeFaceIds);
       } else {
         // Person-filtered / hybrid pipeline
-        const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName)
-        candidateAssets = await this.collectTargetAssetIds(userId, album, faceIds, excludedAssetIds, getFaceName)
+        const excludedAssetIds = await this.fetchExcludedAssetIds(excludeFaceIds, getFaceName);
+        candidateAssets = await this.collectTargetAssetIds(userId, album, faceIds, excludedAssetIds, getFaceName);
       }
 
       // Only fetch existing checksums when we have candidates AND multiple users are configured.
@@ -164,19 +164,19 @@ export class SmartAlbumManager {
       // Update sync state for this album after successful processing.
       // Keyed by stable userId (UUID) — not display name, which can change in Immich.
       if (!this.syncState[userId]) {
-        this.syncState[userId] = {}
+        this.syncState[userId] = {};
       }
-      let currentAlbumState = this.syncState[userId][album.name]
+      let currentAlbumState = this.syncState[userId][album.name];
       if (!currentAlbumState) {
-        currentAlbumState = this.syncState[userId][album.name] = { faces: {} }
+        currentAlbumState = this.syncState[userId][album.name] = { faces: {} };
       }
-      currentAlbumState.minNamedFaces = album.minNamedFaces
+      currentAlbumState.minNamedFaces = album.minNamedFaces;
 
       if ((album.faceNames || []).length === 0) {
-        currentAlbumState.lastAlbumSync = syncStartTime
+        currentAlbumState.lastAlbumSync = syncStartTime;
       } else {
         for (const faceId of faceIds) {
-          currentAlbumState.faces[getFaceName(faceId)] = syncStartTime
+          currentAlbumState.faces[getFaceName(faceId)] = syncStartTime;
         }
       }
 
@@ -190,9 +190,9 @@ export class SmartAlbumManager {
       if (skipped > 0) resultParts.push(`${skipped} duplicate(s) skipped`)
       this.logger.info(`    → ${resultParts.length > 0 ? resultParts.join(', ') : 'nothing to sync'}`)
     } catch (err) {
-        this.logger.error(`    → Failed processing "${album.name}":`, err)
-      }
+      this.logger.error(`    → Failed processing "${album.name}":`, err)
     }
+  }
 
   /**
    * Resolves both the include and exclude face name lists for an album into
@@ -309,7 +309,7 @@ export class SmartAlbumManager {
     updatedAfter?: string | null,
     withPeople: boolean = false
   ): Promise<Map<string, FetchedAssetInfo>> {
-    const assetMap = new Map<string, FetchedAssetInfo>()
+    const assetMap = new Map<string, FetchedAssetInfo>();
     let nextPage: any = 1
 
     if (updatedAfter) {
@@ -325,7 +325,7 @@ export class SmartAlbumManager {
         dto.updatedAfter = updatedAfter
       }
       if (withPeople) {
-        dto.withPeople = true
+        dto.withPeople = true;
       }
       const result = await searchAssets({ metadataSearchDto: dto })
       const items = result.assets?.items || []
