@@ -79,12 +79,8 @@ export class SmartAlbumManager {
         for (const album of user.albums) {
           await this.processAlbum(userId, userName, album)
         }
-      } catch (err: any) {
-        if (err?.data) {
-          this.logger.error('User processing failed:', err.message || err, '\nAPI Response:', JSON.stringify(err.data, null, 2))
-        } else {
+      } catch (err) {
           this.logger.error('User processing failed:', err)
-        }
       }
     }
 
@@ -104,9 +100,11 @@ export class SmartAlbumManager {
     const { faceIds, faceNameToId, excludeFaceIds, excludeFaceNameToId } = await this.resolveAllFaceIds(album)
     const getFaceName = this.buildFaceNameLookup(faceNameToId, excludeFaceNameToId)
 
-    // Conditionally render components without visual glitches:
+    // Conditionally render components:
     const parts: string[] = [`"${album.name}"`]
-    if (album.logic) parts.push(`[${album.logic}]`)
+    if (album.logic) {
+      parts.push(`[${album.logic}]`);
+    }
     if ((album.faceNames || []).length > 0) {
       parts.push(`faces: ${(album.faceNames || []).join(', ')}`)
     }
@@ -165,7 +163,9 @@ export class SmartAlbumManager {
 
       // Update sync state for this album after successful processing.
       // Keyed by stable userId (UUID) — not display name, which can change in Immich.
-      if (!this.syncState[userId]) this.syncState[userId] = {}
+      if (!this.syncState[userId]) {
+        this.syncState[userId] = {}
+      }
       let currentAlbumState = this.syncState[userId][album.name]
       if (!currentAlbumState) {
         currentAlbumState = this.syncState[userId][album.name] = { faces: {} }
@@ -189,19 +189,10 @@ export class SmartAlbumManager {
       if (removedCount > 0) resultParts.push(`-${removedCount} removed`)
       if (skipped > 0) resultParts.push(`${skipped} duplicate(s) skipped`)
       this.logger.info(`    → ${resultParts.length > 0 ? resultParts.join(', ') : 'nothing to sync'}`)
-    } catch (err: any) {
-      if (err?.data) {
-        this.logger.error(
-          `    → Failed processing "${album.name}":`,
-          err.message || err,
-          '\n    API Response:',
-          JSON.stringify(err.data, null, 2)
-        )
-      } else {
+    } catch (err) {
         this.logger.error(`    → Failed processing "${album.name}":`, err)
       }
     }
-  }
 
   /**
    * Resolves both the include and exclude face name lists for an album into
@@ -341,7 +332,7 @@ export class SmartAlbumManager {
 
       for (const asset of items) {
         if (!excludeSet.has(asset.id)) {
-          assetMap.set(asset.id, { checksum: asset.checksum, people: asset.people })
+          assetMap.set(asset.id, { checksum: asset.checksum, people: asset.people });
         }
       }
 
@@ -397,7 +388,7 @@ export class SmartAlbumManager {
   ): Promise<Map<string, string>> {
     if (faceIds.length === 0) {
       if ((album.faceNames || []).length > 0) {
-        this.logger.debug(`No valid faceIds found for album '${album.name}', skipping asset search.`)
+        this.logger.debug(`No valid faceIds found for album '${album.name}', skipping asset search.`);
       }
       return new Map()
     }
@@ -405,8 +396,6 @@ export class SmartAlbumManager {
     if (album.logic === 'OR') {
       return this.collectOrAssets(userId, album, faceIds, excludedAssetIds, getFaceName)
     } else {
-      // Handles explicit 'AND' as well as single-face albums where 'logic' is omitted.
-      // For a single face, set intersection reduces trivially to the single set itself.
       return this.collectAndAssets(userId, album, faceIds, excludedAssetIds, getFaceName)
     }
   }
@@ -434,19 +423,19 @@ export class SmartAlbumManager {
     // We union the per-face results ourselves to achieve OR semantics.
     for (const faceId of faceIds) {
       const label = getFaceName(faceId)
-      const syncDate = this.syncState[userId]?.[album.name]?.faces?.[label] || null
+      const syncDate = this.syncState[userId]?.[album.name]?.faces?.[label] || null;
       const assets = await this.fetchAllAssetIdsForPersons(
         [faceId],
         label,
         excludedAssetIds,
         syncDate,
         album.minNamedFaces !== undefined
-      )
+      );
       for (const [id, info] of assets) {
         if (album.minNamedFaces !== undefined && this.countNamedFaces(info) < album.minNamedFaces) {
-          continue
+          continue;
         }
-        combined.set(id, info.checksum)
+        combined.set(id, info.checksum);
       }
     }
 
@@ -475,7 +464,7 @@ export class SmartAlbumManager {
     // historical assets that now match the full intersection.
     const anyNew = faceIds.some(
       id => !this.syncState[userId]?.[album.name]?.faces?.[getFaceName(id)]
-    )
+    );
     if (anyNew) {
       this.logger.debug('AND logic: new face detected, performing full sync for all faces in this album')
     }
@@ -493,7 +482,7 @@ export class SmartAlbumManager {
         excludedAssetIds,
         syncDate,
         album.minNamedFaces !== undefined
-      )
+      );
       perFaceMaps.push(assetMap)
     }
 
@@ -503,9 +492,9 @@ export class SmartAlbumManager {
     for (const id of intersectedIds) {
       const info = first.get(id)!
       if (album.minNamedFaces !== undefined && this.countNamedFaces(info) < album.minNamedFaces) {
-        continue
+        continue;
       }
-      result.set(id, info.checksum)
+      result.set(id, info.checksum);
     }
     this.logger.debug(`AND logic: intersection count = ${result.size}`)
     return result
@@ -520,22 +509,22 @@ export class SmartAlbumManager {
     album: AlbumSettings,
     excludeFaceIds: string[]
   ): Promise<Map<string, string>> {
-    const syncDate = this.syncState[userId]?.[album.name]?.lastAlbumSync
-    const candidates = new Map<string, string>()
-    let nextPage: any = 1
+    const syncDate = this.syncState[userId]?.[album.name]?.lastAlbumSync;
+    const candidates = new Map<string, string>();
+    let nextPage: any = 1;
 
     do {
-      this.logger.debug(`Fetching page ${nextPage} for count-only album [${album.name}]`)
+      this.logger.debug(`Fetching page ${nextPage} for count-only album [${album.name}]`);
       const dto: any = {
         page: Number(nextPage),
         size: PAGE_SIZE,
         withPeople: true,
-      }
+      };
       if (syncDate) {
-        dto.updatedAfter = syncDate
+        dto.updatedAfter = syncDate;
       }
-      const result = await searchAssets({ metadataSearchDto: dto })
-      const items = result.assets?.items || []
+      const result = await searchAssets({ metadataSearchDto: dto });
+      const items = result.assets?.items || [];
 
       for (const asset of items) {
         // In-Memory Exclusion Check:
@@ -543,20 +532,22 @@ export class SmartAlbumManager {
           p =>
             excludeFaceIds.includes(p.id) ||
             (p.name && album.excludeFaceNames?.includes(p.name))
-        )
-        if (isExcluded) continue
+        );
+        if (isExcluded) {
+          continue;
+        }        
 
         // Threshold Evaluation:
         if (this.countNamedFaces(asset) >= (album.minNamedFaces ?? 1)) {
-          candidates.set(asset.id, asset.checksum)
+          candidates.set(asset.id, asset.checksum);
         }
       }
 
-      this.logger.debug(`Fetched ${items.length} assets for count-only album [${album.name}] (page ${nextPage})`)
-      nextPage = result.assets?.nextPage ?? null
-    } while (nextPage !== null)
+      this.logger.debug(`Fetched ${items.length} assets for count-only album [${album.name}] (page ${nextPage})`);
+      nextPage = result.assets?.nextPage ?? null;
+    } while (nextPage !== null);
 
-    return candidates
+    return candidates;
   }
 
   /**
@@ -652,29 +643,29 @@ export class SmartAlbumManager {
   private loadSyncState(): SmartAlbumSyncState {
     try {
       if (fs.existsSync(this.syncFilePath)) {
-        const content = fs.readFileSync(this.syncFilePath, 'utf-8').trim()
-        const parsed = JSON.parse(content)
+        const content = fs.readFileSync(this.syncFilePath, 'utf-8').trim();
+        const parsed = JSON.parse(content);
         if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-          const migrated: SmartAlbumSyncState = {}
+          const migrated: SmartAlbumSyncState = {};
           for (const [userId, userState] of Object.entries(parsed)) {
-            migrated[userId] = {}
+            migrated[userId] = {};
             if (userState && typeof userState === 'object' && !Array.isArray(userState)) {
               for (const [albumName, albumState] of Object.entries(userState as Record<string, any>)) {
                 if (albumState && typeof albumState === 'object' && !Array.isArray(albumState)) {
                   if (albumState.faces && typeof albumState.faces === 'object') {
-                    migrated[userId][albumName] = albumState as AlbumSyncState
+                    migrated[userId][albumName] = albumState as AlbumSyncState;
                   } else {
                     // Migrate legacy flat { [faceName]: timestamp } dictionary
                     migrated[userId][albumName] = {
                       faces: { ...albumState }
-                    }
+                    };
                   }
                 }
               }
             }
           }
-          this.logger.debug(`Loaded sync state for ${Object.keys(migrated).length} user(s)`)
-          return migrated
+          this.logger.debug(`Loaded sync state for ${Object.keys(migrated).length} user(s)`);
+          return migrated;
         }
         this.logger.warn('Sync state file is invalid — starting fresh (full re-sync)')
       }
@@ -693,4 +684,3 @@ export class SmartAlbumManager {
     }
   }
 }
-

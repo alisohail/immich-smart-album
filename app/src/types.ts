@@ -51,6 +51,8 @@ export interface AlbumSettings {
   minNamedFaces?: number
   /**
    * Determines how multiple `faceNames` are combined:
+   * - `'OR'`  – include assets containing **any** of the listed persons.
+   * - `'AND'` – include only assets containing **all** of the listed persons.
    * Required if `faceNames` contains 2 or more names.
    */
   logic?: 'AND' | 'OR'

@@ -37,10 +37,10 @@ services:
   - `albums`: An array of album objects, each with:
     - `name`: (string) For your reference only; not used as the Immich album title.
     - `albumId`: (string) The Immich album UUID to manage.
-    - `faceNames`: (array of strings, optional) Person names whose assets should be included in the album.
+    - `faceNames`: (array of strings, optional) Only faceNames are supported; these people must be present in the photo.
     - `excludeFaceNames`: (array of strings, optional) If any of these people are present in a photo, it will be excluded from the album.
-    - `minNamedFaces`: (integer $\ge 1$, optional) Minimum number of distinct recognized/named persons required in the photo.
-    - `logic`: ("AND" or "OR", optional) Determines how multiple `faceNames` are combined:
+    - `minNamedFaces`: (integer >= 1, optional) Minimum number of distinct recognized/named persons required in the photo.
+    - `logic`: ("AND" or "OR", optional)
       - "AND": Only photos containing all listed `faceNames` are included.
       - "OR": Photos containing any of the listed `faceNames` are included.
       - *Note:* Required if `faceNames` contains 2 or more names; optional when 0 or 1 names are configured.
@@ -52,7 +52,7 @@ services:
 - **`name` must be unique** across all users and albums. It is used as the sync state key — two entries sharing the same name would overwrite each other's incremental sync dates.
 - **`albumId` must be unique** within each user's album list. Pointing two entries within the same user at the same Immich album would cause duplicate processing.
 - **`faceNames` or `minNamedFaces` required**: Every album must specify at least one of non-empty `faceNames` or `minNamedFaces >= 1`.
-- **`minNamedFaces` must be a positive integer** ($\ge 1$) when configured.
+- **`minNamedFaces` must be a positive integer** (>= 1) when configured.
 - **`logic` operator**: If specified, must strictly be `"AND"` or `"OR"`. It is required whenever `faceNames` contains 2 or more names.
 
 All rules are validated on startup. The container will exit with a clear error message if any rule is violated.
